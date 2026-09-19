@@ -78,7 +78,7 @@ $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
 ```
 
-설치 스크립트는 최적화된 바이너리(`reto-cli` / `reto-cli.exe`)를 `~/.local/bin/`에 설치하고, 필요한 ONNX Runtime 동적 라이브러리를 자동 설정합니다.
+설치 스크립트는 최적화된 바이너리(Linux/macOS: `~/.local/bin/reto-cli`, Windows: `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe`)를 설치하고, 필요한 ONNX Runtime 동적 라이브러리를 자동 설정합니다.
 
 #### 소스 코드에서 직접 빌드 (개발자용)
 
