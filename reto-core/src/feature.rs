@@ -1001,7 +1001,7 @@ pub trait FeatureMatcher: Send + Sync {
                 .fold(0.0_f32, f32::max);
             let mean_disparity: f32 = verified_triplets
                 .iter()
-                .map(|t| 0.5 * (t.disparity_01 + t.disparity_12))
+                .map(|t| f32::midpoint(t.disparity_01, t.disparity_12))
                 .sum::<f32>()
                 / n;
             let relative_extrinsic_loss_pct = if mean_disparity > 1e-4 {
