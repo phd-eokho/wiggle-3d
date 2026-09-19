@@ -387,10 +387,14 @@ impl WiggleAligner {
                 let frame1_h = features[1].image_size.height as f32;
 
                 if frame1_w > 0.0 && frame1_h > 0.0 {
-                    let mut face_dx_01 = Vec::new();
-                    let mut face_dy_01 = Vec::new();
-                    let mut face_dx_21 = Vec::new();
-                    let mut face_dy_21 = Vec::new();
+                    let mut accum = [0.0_f32; 4]; // [sum_dx_01, sum_dy_01, sum_dx_21, sum_dy_21]
+                    let mut face_displacements: Option<Vec<[f32; 4]>> =
+                        if tracing::enabled!(tracing::Level::DEBUG) {
+                            Some(Vec::new())
+                        } else {
+                            None
+                        };
+                    let mut count = 0usize;
 
                     for t in triplets {
                         if t.index_0 < features[0].keypoints.len()
@@ -404,27 +408,59 @@ impl WiggleAligner {
                             if face_bbox.contains_point(norm_x, norm_y) {
                                 let p0 = features[0].keypoints[t.index_0].point;
                                 let p2 = features[2].keypoints[t.index_2].point;
-                                face_dx_01.push(p1.x - p0.x);
-                                face_dy_01.push(p1.y - p0.y);
-                                face_dx_21.push(p1.x - p2.x);
-                                face_dy_21.push(p1.y - p2.y);
+                                let d = [p1.x - p0.x, p1.y - p0.y, p1.x - p2.x, p1.y - p2.y];
+                                accum[0] += d[0];
+                                accum[1] += d[1];
+                                accum[2] += d[2];
+                                accum[3] += d[3];
+                                count += 1;
+                                if let Some(ref mut disps) = face_displacements {
+                                    disps.push(d);
+                                }
                             }
                         }
                     }
 
-                    if !face_dx_01.is_empty() {
-                        let count = face_dx_01.len() as f32;
-                        let avg_dx_01: f32 = face_dx_01.iter().sum::<f32>() / count;
-                        let avg_dy_01: f32 = face_dy_01.iter().sum::<f32>() / count;
-                        let avg_dx_21: f32 = face_dx_21.iter().sum::<f32>() / count;
-                        let avg_dy_21: f32 = face_dy_21.iter().sum::<f32>() / count;
+                    if count > 0 {
+                        let inv_count = 1.0 / (count as f32);
+                        let avg_dx_01 = accum[0] * inv_count;
+                        let avg_dy_01 = accum[1] * inv_count;
+                        let avg_dx_21 = accum[2] * inv_count;
+                        let avg_dy_21 = accum[3] * inv_count;
 
                         tracing::info!(
-                            triplet_points = face_dx_01.len(),
+                            triplet_points = count,
                             shift_0 = ?(avg_dx_01, avg_dy_01),
                             shift_2 = ?(avg_dx_21, avg_dy_21),
                             "Locked parallax focal plane onto dominant portrait face (Tier 1 Face Priority)"
                         );
+
+                        if let Some(disps) = face_displacements {
+                            let mut var_accum = [0.0_f32; 4];
+                            for d in &disps {
+                                let diff = [
+                                    d[0] - avg_dx_01,
+                                    d[1] - avg_dy_01,
+                                    d[2] - avg_dx_21,
+                                    d[3] - avg_dy_21,
+                                ];
+                                var_accum[0] += diff[0] * diff[0];
+                                var_accum[1] += diff[1] * diff[1];
+                                var_accum[2] += diff[2] * diff[2];
+                                var_accum[3] += diff[3] * diff[3];
+                            }
+                            let std_shift_0_px =
+                                ((var_accum[0] + var_accum[1]) * inv_count).sqrt();
+                            let std_shift_2_px =
+                                ((var_accum[2] + var_accum[3]) * inv_count).sqrt();
+
+                            tracing::debug!(
+                                triplet_points = count,
+                                std_shift_0_px,
+                                std_shift_2_px,
+                                "Portrait face alignment focal plane dispersion residuals"
+                            );
+                        }
 
                         return [(avg_dx_01, avg_dy_01), (0.0, 0.0), (avg_dx_21, avg_dy_21)];
                     }
@@ -604,22 +640,20 @@ impl WiggleAligner {
 
         // 6. Compute average translation shifts for the depth surface set
         let count = cluster_triplet_indices.len() as f32;
-        let mut sum_01_x = 0.0;
-        let mut sum_01_y = 0.0;
-        let mut sum_21_x = 0.0;
-        let mut sum_21_y = 0.0;
+        let mut accum = [0.0_f32; 4]; // [sum_01_x, sum_01_y, sum_21_x, sum_21_y]
 
         for &idx in &cluster_triplet_indices {
             let item = &data[idx];
-            sum_01_x += item.dx_01;
-            sum_01_y += item.dy_01;
-            sum_21_x += item.dx_21;
-            sum_21_y += item.dy_21;
+            accum[0] += item.dx_01;
+            accum[1] += item.dy_01;
+            accum[2] += item.dx_21;
+            accum[3] += item.dy_21;
         }
 
-        let shift_0 = (sum_01_x / count, sum_01_y / count);
+        let inv_count = 1.0 / count;
+        let shift_0 = (accum[0] * inv_count, accum[1] * inv_count);
         let shift_1 = (0.0, 0.0);
-        let shift_2 = (sum_21_x / count, sum_21_y / count);
+        let shift_2 = (accum[2] * inv_count, accum[3] * inv_count);
         let shifts = [shift_0, shift_1, shift_2];
 
         // 7. Construct complete DisparityHistogramData records
@@ -680,6 +714,31 @@ impl WiggleAligner {
             shift_2 = ?shift_2,
             "Calculated depth surface cluster baseline alignment shifts"
         );
+
+        if tracing::enabled!(tracing::Level::DEBUG) && !cluster_triplet_indices.is_empty() {
+            let mut var_accum = [0.0_f32; 4];
+            for &idx in &cluster_triplet_indices {
+                let d = &data[idx];
+                let diff = [
+                    d.dx_01 - shift_0.0,
+                    d.dy_01 - shift_0.1,
+                    d.dx_21 - shift_2.0,
+                    d.dy_21 - shift_2.1,
+                ];
+                var_accum[0] += diff[0] * diff[0];
+                var_accum[1] += diff[1] * diff[1];
+                var_accum[2] += diff[2] * diff[2];
+                var_accum[3] += diff[3] * diff[3];
+            }
+            let std_shift_0_px = ((var_accum[0] + var_accum[1]) * inv_count).sqrt();
+            let std_shift_2_px = ((var_accum[2] + var_accum[3]) * inv_count).sqrt();
+            tracing::debug!(
+                surface_points = cluster_triplet_indices.len(),
+                std_shift_0_px,
+                std_shift_2_px,
+                "Depth surface alignment focal plane dispersion residuals"
+            );
+        }
 
         (shifts, debug_data)
     }
