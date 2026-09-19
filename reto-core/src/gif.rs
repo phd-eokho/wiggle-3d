@@ -23,10 +23,21 @@ pub const DEFAULT_PALETTE_COLORS: usize = 256;
 
 /// Configuration for Wiggle 3D GIF generation.
 ///
-/// # TODO (Motion Interpolation & Easing Curve Playback)
-/// Linear ping-pong frame delays (e.g. 100ms) can appear rigid at motion turnaround points.
-/// Support non-linear timing curves (ease-in / ease-out) at direction inflection points (Frames 0 and 2)
-/// or intermediate frame blending/morphing (optical flow frame interpolation) for ultra-smooth 60 fps playback.
+/// # TODO (Adaptive GIF Timing & Motion Interpolation)
+/// - **Non-Uniform Inter-Frame Delays (Physical Baseline Compensation):**
+///   Due to mechanical construction tolerances and assembly errors, multi-lens camera optics
+///   are rarely perfectly collinear along a shared epipolar line or symmetrically spaced. As a result,
+///   the relative rigid transforms (rotations $R_{01}, R_{12}$ and translations $\mathbf{t}_{01}, \mathbf{t}_{12}$)
+///   from Frame 0 $\to$ 1 and Frame 1 $\to$ 2 exhibit slight discrepancies in magnitude and direction.
+///   When simulating continuous linear motion across views, the inter-frame delays of the GIF
+///   ($\Delta t_{0\to 1}$ and $\Delta t_{1\to 2}$) should be adjusted proportionally to the computed
+///   physical disparity/baseline distances rather than using a uniform time split. This ensures
+///   background and parallax features traverse a constant physical distance per unit time, resulting
+///   in a noticeably smoother visual oscillation.
+/// - **Easing Curves & Optical Flow Interpolation:**
+///   Support non-linear timing curves (ease-in / ease-out) at direction turnaround inflection points
+///   (Frames 0 and 2), or intermediate frame blending/morphing (optical flow frame synthesis) for
+///   high-framerate playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WiggleGifConfig {
     /// Inter-frame delay in milliseconds.
