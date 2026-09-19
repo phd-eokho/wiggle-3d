@@ -1863,7 +1863,8 @@ pub fn refine_keypoints_subpixel(
         let y_init = kp.point.y;
 
         // Check if initial keypoint is within safe margins
-        if x_init < min_bound || x_init > max_bound_x || y_init < min_bound || y_init > max_bound_y {
+        if x_init < min_bound || x_init > max_bound_x || y_init < min_bound || y_init > max_bound_y
+        {
             return;
         }
 
@@ -1904,8 +1905,10 @@ pub fn refine_keypoints_subpixel(
                     let weight = weight_y * weight_x;
 
                     // Branchless contiguous central gradient evaluation
-                    let ix = 0.5 * (f32::from(row[px + 1]) - f32::from(row[px - 1])) * (1.0 / 255.0);
-                    let iy = 0.5 * (f32::from(next_row[px]) - f32::from(prev_row[px])) * (1.0 / 255.0);
+                    let ix =
+                        0.5 * (f32::from(row[px + 1]) - f32::from(row[px - 1])) * (1.0 / 255.0);
+                    let iy =
+                        0.5 * (f32::from(next_row[px]) - f32::from(prev_row[px])) * (1.0 / 255.0);
 
                     let ix2 = ix * ix;
                     let iy2 = iy * iy;
@@ -1947,7 +1950,8 @@ pub fn refine_keypoints_subpixel(
             x_curr += step_x;
             y_curr += step_y;
 
-            let drift_sq = (x_curr - x_init) * (x_curr - x_init) + (y_curr - y_init) * (y_curr - y_init);
+            let drift_sq =
+                (x_curr - x_init) * (x_curr - x_init) + (y_curr - y_init) * (y_curr - y_init);
             if drift_sq > max_drift_sq {
                 // Revert to initial if displacement wandered too far
                 x_curr = x_init;
@@ -2252,16 +2256,14 @@ impl PointDetector for SuperPointDetector {
             .to_image();
 
             let longest_side = pixel_rect.width.max(pixel_rect.height);
-            let (scale, scaled_w, scaled_h, scaled_img) = if longest_side > POINT_DETECTION_MAX_LONGEST_EDGE {
+            let (scale, scaled_w, scaled_h, scaled_img) = if longest_side
+                > POINT_DETECTION_MAX_LONGEST_EDGE
+            {
                 let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
                 let sw = (pixel_rect.width as f32 * s).round() as u32;
                 let sh = (pixel_rect.height as f32 * s).round() as u32;
-                let scaled = image::imageops::resize(
-                    &crop,
-                    sw,
-                    sh,
-                    image::imageops::FilterType::Triangle,
-                );
+                let scaled =
+                    image::imageops::resize(&crop, sw, sh, image::imageops::FilterType::Triangle);
                 (s, sw, sh, Some(scaled))
             } else {
                 (1.0, pixel_rect.width, pixel_rect.height, None)
@@ -2786,8 +2788,12 @@ mod tests {
         let detector_off = SuperPointDetector::new(config_disabled);
         let detector_on = SuperPointDetector::new(config_enabled);
 
-        let kps_off = detector_off.detect_luma(&luma, Size2D::new(100, 100)).unwrap();
-        let kps_on = detector_on.detect_luma(&luma, Size2D::new(100, 100)).unwrap();
+        let kps_off = detector_off
+            .detect_luma(&luma, Size2D::new(100, 100))
+            .unwrap();
+        let kps_on = detector_on
+            .detect_luma(&luma, Size2D::new(100, 100))
+            .unwrap();
 
         assert!(!kps_off.is_empty());
         assert!(!kps_on.is_empty());

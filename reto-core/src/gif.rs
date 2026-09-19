@@ -449,10 +449,8 @@ impl WiggleAligner {
                                 var_accum[2] += diff[2] * diff[2];
                                 var_accum[3] += diff[3] * diff[3];
                             }
-                            let std_shift_0_px =
-                                ((var_accum[0] + var_accum[1]) * inv_count).sqrt();
-                            let std_shift_2_px =
-                                ((var_accum[2] + var_accum[3]) * inv_count).sqrt();
+                            let std_shift_0_px = ((var_accum[0] + var_accum[1]) * inv_count).sqrt();
+                            let std_shift_2_px = ((var_accum[2] + var_accum[3]) * inv_count).sqrt();
 
                             tracing::debug!(
                                 triplet_points = count,
