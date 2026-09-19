@@ -4,7 +4,7 @@
 
 set -eu
 
-REPO="${WIGGLE3D_REPO:-DeokhoKim/wiggle-3d}"
+REPO="${WIGGLE3D_REPO:-phd-eokho/wiggle-3d}"
 INSTALL_DIR="${WIGGLE3D_INSTALL_DIR:-$HOME/.local/bin}"
 LIB_DIR="${WIGGLE3D_LIB_DIR:-$(dirname "$INSTALL_DIR")/lib}"
 STATE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/reto3d"
@@ -171,11 +171,12 @@ fi
 # 5. Extract Archive
 tar -xzf "${TMP_DIR}/${TAR_NAME}" -C "$TMP_DIR"
 
-[ -f "${TMP_DIR}/reto-cli" ] || { log_error "Binary 'reto-cli' was not found in the downloaded archive."; exit 1; }
+BIN_SRC="$(find "$TMP_DIR" -maxdepth 2 -type f -name "reto-cli" | head -n 1)"
+[ -n "$BIN_SRC" ] && [ -f "$BIN_SRC" ] || { log_error "Binary 'reto-cli' was not found in the downloaded archive."; exit 1; }
 
 # 6. Install Binary
 mkdir -p "$INSTALL_DIR"
-mv "${TMP_DIR}/reto-cli" "${INSTALL_DIR}/reto-cli"
+mv "$BIN_SRC" "${INSTALL_DIR}/reto-cli"
 chmod +x "${INSTALL_DIR}/reto-cli"
 
 log_info "Successfully installed 'reto-cli' to ${INSTALL_DIR}/reto-cli"

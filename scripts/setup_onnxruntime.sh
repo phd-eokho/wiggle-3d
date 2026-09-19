@@ -48,11 +48,20 @@ if [ ! -f "${EXTRACT_DIR}/lib/libonnxruntime.so" ]; then
     rm -f "$TARGET_TAR"
 fi
 
-SO_PATH="$(cd "${EXTRACT_DIR}/lib" && pwd)/libonnxruntime.so"
+SO_PATH="${EXTRACT_DIR}/lib/libonnxruntime.so"
 LIB_DIR="$(cd "${EXTRACT_DIR}/lib" && pwd)"
+ln -sfn "${LIB_DIR}" ".cache_reto3d/lib"
+
 echo "ONNX Runtime (${PACKAGE_TYPE}) shared library ready at: ${SO_PATH}"
+echo "Canonical symlink created at: .cache_reto3d/lib"
 echo "To compile with standard dynamic linking, export:"
 echo "  export ORT_LIB_LOCATION=\"${LIB_DIR}\""
 echo "  export ORT_PREFER_DYNAMIC_LINK=1"
 echo "To run binaries with dynamic linking, export:"
 echo "  export LD_LIBRARY_PATH=\"${LIB_DIR}:\${LD_LIBRARY_PATH:-}\""
+
+if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "ORT_LIB_LOCATION=${LIB_DIR}" >> "$GITHUB_ENV"
+    echo "ORT_PREFER_DYNAMIC_LINK=1" >> "$GITHUB_ENV"
+    echo "LD_LIBRARY_PATH=${LIB_DIR}:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+fi

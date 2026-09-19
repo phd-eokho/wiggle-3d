@@ -1,5 +1,5 @@
 [env]
-ORT_LIB_LOCATION = { value = ".cache_reto3d/onnxruntime/onnxruntime-linux-x64-gpu-1.19.2/lib", relative = true }
+ORT_LIB_LOCATION = { value = ".cache_reto3d/lib", relative = true }
 ORT_PREFER_DYNAMIC_LINK = "1"
 
 [target.x86_64-unknown-linux-gnu]

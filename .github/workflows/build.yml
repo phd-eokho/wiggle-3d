@@ -19,16 +19,9 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  build:
-    name: Build & Test (${{ matrix.platform }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux-x86_64
+  lint-check:
+    name: Lint & Formatting (Ubuntu)
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -39,7 +32,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
       - name: Rust Cache
@@ -51,29 +43,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - name: Build workspace
-        run: cargo build --workspace --all-targets --verbose
-
-      - name: Run tests
-        run: cargo test --workspace --all-targets --verbose
-
-      - name: Run doc-tests
-        run: cargo test --workspace --doc --verbose
-
-  release:
-    name: Build Release Artifacts (${{ matrix.platform }})
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            platform: linux-x86_64
-    permissions:
-      contents: write
+  build-linux:
+    name: Build & Package (Linux x86_64)
+    needs: [lint-check]
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -84,30 +57,114 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Run tests
+        run: cargo test --workspace --all-targets --verbose
+
+      - name: Run doc-tests
+        run: cargo test --workspace --doc --verbose
+
       - name: Build Release Binary
-        run: cargo build --release --workspace
+        run: cargo build --release --locked --bin reto-cli
 
       - name: Package Release Binary
         run: |
           DIST_DIR=$(mktemp -d)
           echo "DIST_DIR=${DIST_DIR}" >> "$GITHUB_ENV"
-          tar -czvf "${DIST_DIR}/wiggle-3d-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz" -C target/release reto-cli
+          PKG_NAME="${{ github.ref_name }}"
+          [ -z "$PKG_NAME" ] && PKG_NAME="${{ github.sha }}"
+          STAGE_DIR="${DIST_DIR}/wiggle-3d-${PKG_NAME}-linux-x86_64"
+          mkdir -p "${STAGE_DIR}"
+          cp target/release/reto-cli "${STAGE_DIR}/"
+          [ -f README.md ] && cp README.md "${STAGE_DIR}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE_DIR}/"
+          tar -czvf "${DIST_DIR}/wiggle-3d-${PKG_NAME}-linux-x86_64.tar.gz" -C "${DIST_DIR}" "wiggle-3d-${PKG_NAME}-linux-x86_64"
+          tar --zstd -cvf "${DIST_DIR}/wiggle-3d-${PKG_NAME}-linux-x86_64.tar.zst" -C "${DIST_DIR}" "wiggle-3d-${PKG_NAME}-linux-x86_64"
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wiggle-3d-${{ github.ref_name }}-${{ matrix.platform }}
-          path: ${{ env.DIST_DIR }}/wiggle-3d-${{ github.ref_name }}-${{ matrix.platform }}.tar.gz
+          name: release-linux-x86_64
+          path: |
+            ${{ env.DIST_DIR }}/*.tar.gz
+            ${{ env.DIST_DIR }}/*.tar.zst
+          if-no-files-found: error
+
+  build-windows:
+    name: Build & Package (Windows x86_64)
+    needs: [lint-check]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup ONNX Runtime
+        shell: pwsh
+        run: pwsh scripts/setup_onnxruntime.ps1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --verbose
+
+      - name: Run doc-tests
+        run: cargo test --workspace --doc --verbose
+
+      - name: Build Release Binary
+        run: cargo build --release --locked --bin reto-cli
+
+      - name: Package Release Binary
+        shell: pwsh
+        run: |
+          $DistDir = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "dist")
+          echo "DIST_DIR=$($DistDir.FullName)" >> $env:GITHUB_ENV
+          $PkgName = if ("${{ github.ref_name }}") { "${{ github.ref_name }}" } else { "${{ github.sha }}" }
+          $StageDir = New-Item -ItemType Directory -Path (Join-Path $DistDir.FullName "wiggle-3d-$PkgName-windows-x86_64")
+          Copy-Item target/release/reto-cli.exe $StageDir.FullName
+          if (Test-Path README.md) { Copy-Item README.md $StageDir.FullName }
+          if (Test-Path LICENSE) { Copy-Item LICENSE $StageDir.FullName }
+          Compress-Archive -Path "$($StageDir.FullName)\*" -DestinationPath "$($DistDir.FullName)\wiggle-3d-$PkgName-windows-x86_64.zip"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x86_64
+          path: ${{ env.DIST_DIR }}/*.zip
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Stage Release Assets
+        run: |
+          mkdir -p release-assets
+          find release-artifacts -type f \( -name "*.tar.gz" -o -name "*.tar.zst" -o -name "*.zip" \) -exec cp {} release-assets/ \;
+          ls -lh release-assets/
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ env.DIST_DIR }}/*
+          files: release-assets/*
           generate_release_notes: true
           draft: true
 
