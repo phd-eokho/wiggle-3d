@@ -48,26 +48,42 @@
 
 #### 1-라인 자동 설치 (권장)
 
+**Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
 
 NVIDIA GPU (CUDA) 가속 사용 시:
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
+curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
 
-설치 스크립트는 최적화된 바이너리를 `~/.local/bin/reto-cli`에 설치하고, 필요한 ONNX Runtime 라이브러리를 `~/.local/lib/`에 자동 설정합니다.
-
-*삭제(Uninstall) 시:*
+*삭제(Uninstall) 시 (Linux / macOS):*
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh -s -- --uninstall
 ```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
+```
+
+NVIDIA GPU (CUDA) 가속 사용 시:
+```powershell
+$env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
+```
+
+*삭제(Uninstall) 시 (Windows):*
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
+```
+
+설치 스크립트는 최적화된 바이너리(`reto-cli` / `reto-cli.exe`)를 `~/.local/bin/`에 설치하고, 필요한 ONNX Runtime 동적 라이브러리를 자동 설정합니다.
 
 #### 소스 코드에서 직접 빌드 (개발자용)
 
 ```bash
-git clone https://github.com/DeokhoKim/wiggle-3d.git
+git clone https://github.com/phd-eokho/wiggle-3d.git
 cd wiggle-3d
 cargo build --release
 ```

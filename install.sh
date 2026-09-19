@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # Wiggle-3D Standalone 1-Line Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh
+# Usage: curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 
 set -eu
 
