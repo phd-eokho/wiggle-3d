@@ -13,6 +13,7 @@ use ndarray::{Array4, ArrayViewD, Axis};
 use num_traits::ToPrimitive;
 use ort::session::Session;
 use ort::value::Tensor;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -903,6 +904,7 @@ pub trait FeatureMatcher: Send + Sync {
     ///
     /// # Errors
     /// Returns [`AlignmentError`] if frames count is less than 3 or pairwise matching fails.
+    #[allow(clippy::cast_precision_loss)]
     fn extract_consistent_triplets(
         &self,
         frames: &[FeatureFrame],
@@ -985,6 +987,38 @@ pub trait FeatureMatcher: Send + Sync {
             verified_count = verified_triplets.len(),
             "Candidate triplets evaluated"
         );
+
+        if tracing::enabled!(tracing::Level::DEBUG) && !verified_triplets.is_empty() {
+            let n = verified_triplets.len() as f32;
+            let sum_sq_cascade: f32 = verified_triplets
+                .iter()
+                .map(|t| t.cascade_error * t.cascade_error)
+                .sum();
+            let rmse_cascade_err = (sum_sq_cascade / n).sqrt();
+            let max_cascade_err: f32 = verified_triplets
+                .iter()
+                .map(|t| t.cascade_error)
+                .fold(0.0_f32, f32::max);
+            let mean_disparity: f32 = verified_triplets
+                .iter()
+                .map(|t| f32::midpoint(t.disparity_01, t.disparity_12))
+                .sum::<f32>()
+                / n;
+            let relative_extrinsic_loss_pct = if mean_disparity > 1e-4 {
+                (rmse_cascade_err / mean_disparity) * 100.0
+            } else {
+                0.0
+            };
+
+            tracing::debug!(
+                verified_triplets = verified_triplets.len(),
+                rmse_cascade_error_px = rmse_cascade_err,
+                max_cascade_error_px = max_cascade_err,
+                mean_disparity_px = mean_disparity,
+                relative_extrinsic_loss_pct,
+                "Extrinsic parameter consistency & parallax-aware reprojection loss"
+            );
+        }
 
         // Sort triplets by confidence descending
         verified_triplets.sort_unstable_by(|a, b| {
@@ -1167,6 +1201,12 @@ pub struct SuperPointConfig {
     pub remove_borders: usize,
     /// Target execution device (CPU or CUDA).
     pub device: BackendDevice,
+    /// Whether to apply sub-pixel patch refinement on full-resolution ROI images (default: `true`).
+    pub subpixel_refinement: bool,
+    /// Half-window radius for sub-pixel patch refinement (default: 7, yielding a 15x15 pixel patch).
+    pub subpixel_patch_radius: usize,
+    /// Maximum iterations for sub-pixel refinement convergence (default: 5).
+    pub subpixel_max_iterations: usize,
     /// Optional explicit path to `superpoint.onnx` model weights.
     pub model_path: Option<PathBuf>,
     /// Remote URL for downloading the model if missing from cache.
@@ -1203,6 +1243,9 @@ impl Default for SuperPointConfig {
             max_keypoints_per_image: 4096,
             remove_borders: 4,
             device: BackendDevice::default_available(),
+            subpixel_refinement: true,
+            subpixel_patch_radius: DEFAULT_SUBPIXEL_PATCH_RADIUS,
+            subpixel_max_iterations: DEFAULT_SUBPIXEL_MAX_ITERATIONS,
             model_path: None,
             model_url: DEFAULT_SUPERPOINT_MODEL_URL.to_string(),
             expected_sha256: Some(DEFAULT_SUPERPOINT_MODEL_SHA256.to_string()),
@@ -1737,6 +1780,194 @@ impl SuperPointDetector {
     }
 }
 
+/// Default patch radius in pixels for sub-pixel keypoint refinement (7 pixels -> 15x15 pixel patch).
+pub const DEFAULT_SUBPIXEL_PATCH_RADIUS: usize = 7;
+
+/// Default maximum iterations for sub-pixel keypoint refinement convergence (5 iterations).
+pub const DEFAULT_SUBPIXEL_MAX_ITERATIONS: usize = 5;
+
+/// Default convergence displacement epsilon in pixels for sub-pixel keypoint refinement (0.01 px).
+pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
+
+/// Refines keypoint coordinates to sub-pixel accuracy using localized gradient-based photometric patch tracking (Förstner / Lucas-Kanade corner operator).
+///
+/// For each keypoint detected on coarse or downscaled grids, this samples a full-resolution patch
+/// ($W \times W$ where $W = 2 \times \text{radius} + 1$) around the keypoint, evaluates spatial image gradients
+/// $(I_x, I_y)$, and iteratively solves for the optimal sub-pixel displacement $\mathbf{\delta}$ that minimizes
+/// photometric gradient orthogonal deviation.
+///
+/// # Arguments
+/// * `image` - Grayscale image buffer of the region of interest at full resolution.
+/// * `keypoints` - Mutable slice of detected keypoints to refine in-place.
+/// * `radius` - Patch half-window radius in pixels (e.g. 7 for a 15x15 window).
+/// * `max_iterations` - Maximum refinement iterations (e.g. 5).
+/// * `epsilon` - Convergence displacement threshold in pixels (e.g. 0.01).
+///
+/// # Examples
+/// ```
+/// use reto_core::{refine_keypoints_subpixel, KeyPoint, Point2D};
+/// use image::GrayImage;
+///
+/// let mut img = GrayImage::new(32, 32);
+/// for y in 0..16 {
+///     for x in 0..16 {
+///         img.put_pixel(x, y, image::Luma([255]));
+///     }
+/// }
+///
+/// let mut kps = vec![KeyPoint::new(Point2D::new(15.2, 15.3), 0.95, None)];
+/// refine_keypoints_subpixel(&img, &mut kps, 5, 5, 0.01);
+/// assert!(kps[0].point.x >= 14.0 && kps[0].point.x <= 16.5);
+/// ```
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss,
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops,
+    clippy::similar_names,
+    clippy::suspicious_operation_groupings
+)]
+pub fn refine_keypoints_subpixel(
+    image: &image::GrayImage,
+    keypoints: &mut [KeyPoint],
+    radius: usize,
+    max_iterations: usize,
+    epsilon: f32,
+) {
+    let (width, height) = image.dimensions();
+    let r = radius as isize;
+    let min_dim = (2 * radius + 3) as u32;
+
+    if width < min_dim || height < min_dim || keypoints.is_empty() {
+        return;
+    }
+
+    let raw = image.as_raw();
+    let w = width as usize;
+    let sigma = (radius as f32 / 2.0).max(1.0);
+    let two_sigma_sq = 2.0 * sigma * sigma;
+    let inv_two_sigma_sq = 1.0 / two_sigma_sq;
+    let eps_sq = epsilon * epsilon;
+    let max_step_sq = 1.5_f32 * 1.5_f32;
+    let max_drift_sq = 2.5_f32 * 2.5_f32;
+
+    let min_bound = (radius + 1) as f32;
+    let max_bound_x = (width.saturating_sub(radius as u32 + 2)) as f32;
+    let max_bound_y = (height.saturating_sub(radius as u32 + 2)) as f32;
+
+    // Parallel keypoint batch refinement via Rayon
+    keypoints.par_iter_mut().for_each(|kp| {
+        let x_init = kp.point.x;
+        let y_init = kp.point.y;
+
+        // Check if initial keypoint is within safe margins
+        if x_init < min_bound || x_init > max_bound_x || y_init < min_bound || y_init > max_bound_y
+        {
+            return;
+        }
+
+        let mut x_curr = x_init;
+        let mut y_curr = y_init;
+
+        for _ in 0..max_iterations {
+            let mut a = 0.0_f32; // sum w * Ix^2
+            let mut b = 0.0_f32; // sum w * Ix * Iy
+            let mut c = 0.0_f32; // sum w * Iy^2
+            let mut vx = 0.0_f32; // sum w * (Ix^2 * delta_x + Ix * Iy * delta_y)
+            let mut vy = 0.0_f32; // sum w * (Ix * Iy * delta_x + Iy^2 * delta_y)
+
+            let cx_round = x_curr.round() as isize;
+            let cy_round = y_curr.round() as isize;
+
+            if cx_round - r - 1 < 0
+                || cx_round + r + 1 >= width as isize
+                || cy_round - r - 1 < 0
+                || cy_round + r + 1 >= height as isize
+            {
+                break;
+            }
+
+            for dy in -r..=r {
+                let py = (cy_round + dy) as usize;
+                let delta_y = ((cy_round + dy) as f32) - y_curr;
+                let weight_y = (-delta_y * delta_y * inv_two_sigma_sq).exp();
+
+                let row = &raw[py * w..(py + 1) * w];
+                let prev_row = &raw[(py - 1) * w..py * w];
+                let next_row = &raw[(py + 1) * w..(py + 2) * w];
+
+                for dx in -r..=r {
+                    let px = (cx_round + dx) as usize;
+                    let delta_x = ((cx_round + dx) as f32) - x_curr;
+                    let weight_x = (-delta_x * delta_x * inv_two_sigma_sq).exp();
+                    let weight = weight_y * weight_x;
+
+                    // Branchless contiguous central gradient evaluation
+                    let ix =
+                        0.5 * (f32::from(row[px + 1]) - f32::from(row[px - 1])) * (1.0 / 255.0);
+                    let iy =
+                        0.5 * (f32::from(next_row[px]) - f32::from(prev_row[px])) * (1.0 / 255.0);
+
+                    let ix2 = ix * ix;
+                    let iy2 = iy * iy;
+                    let ixy = ix * iy;
+
+                    a += weight * ix2;
+                    b += weight * ixy;
+                    c += weight * iy2;
+
+                    vx += weight * (ix2 * delta_x + ixy * delta_y);
+                    vy += weight * (ixy * delta_x + iy2 * delta_y);
+                }
+            }
+
+            let det = a * c - b * b;
+            let tr = a + c;
+
+            // Structure tensor conditioning check (ensure non-degenerate 2D corner)
+            if det < 1e-7 || tr < 1e-5 {
+                break;
+            }
+
+            let trace_sq_minus_4det = (tr * tr - 4.0 * det).max(0.0);
+            let lambda_min = 0.5 * (tr - trace_sq_minus_4det.sqrt());
+            if lambda_min < 1e-5 {
+                break;
+            }
+
+            // Solve 2x2 linear system G * [step_x; step_y] = [vx; vy]
+            let inv_det = 1.0 / det;
+            let step_x = (c * vx - b * vy) * inv_det;
+            let step_y = (-b * vx + a * vy) * inv_det;
+
+            let step_norm_sq = step_x * step_x + step_y * step_y;
+            if step_norm_sq > max_step_sq || step_x.is_nan() || step_y.is_nan() {
+                break;
+            }
+
+            x_curr += step_x;
+            y_curr += step_y;
+
+            let drift_sq =
+                (x_curr - x_init) * (x_curr - x_init) + (y_curr - y_init) * (y_curr - y_init);
+            if drift_sq > max_drift_sq {
+                // Revert to initial if displacement wandered too far
+                x_curr = x_init;
+                y_curr = y_init;
+                break;
+            }
+
+            if step_norm_sq < eps_sq {
+                break;
+            }
+        }
+
+        kp.point = Point2D::new(x_curr, y_curr);
+    });
+}
+
 /// Target maximum resolution for the longest dimension during keypoint feature extraction (720 pixels).
 pub const POINT_DETECTION_MAX_LONGEST_EDGE: u32 = 720;
 
@@ -1794,7 +2025,7 @@ impl PointDetector for SuperPointDetector {
             .unwrap_or_else(|| image::GrayImage::new(size.width, size.height));
 
         let scaled_img = if scaled_w == size.width && scaled_h == size.height {
-            gray_orig
+            gray_orig.clone()
         } else {
             image::imageops::resize(
                 &gray_orig,
@@ -1849,7 +2080,18 @@ impl PointDetector for SuperPointDetector {
             })();
 
             match plan_res {
-                Ok(kps) => return Ok(kps),
+                Ok(mut kps) => {
+                    if self.config.subpixel_refinement {
+                        refine_keypoints_subpixel(
+                            &gray_orig,
+                            &mut kps,
+                            self.config.subpixel_patch_radius,
+                            self.config.subpixel_max_iterations,
+                            DEFAULT_SUBPIXEL_EPSILON_PX,
+                        );
+                    }
+                    return Ok(kps);
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "ONNX SuperPoint model execution failed; falling back");
                 }
@@ -1875,7 +2117,7 @@ impl PointDetector for SuperPointDetector {
         );
 
         let inv_scale = 1.0 / scale;
-        let keypoints: Vec<KeyPoint> = nms_points
+        let mut keypoints: Vec<KeyPoint> = nms_points
             .into_iter()
             .take(self.config.max_keypoints_per_image)
             .map(|(pt, score)| {
@@ -1886,6 +2128,16 @@ impl PointDetector for SuperPointDetector {
                 )
             })
             .collect();
+
+        if self.config.subpixel_refinement {
+            refine_keypoints_subpixel(
+                &gray_orig,
+                &mut keypoints,
+                self.config.subpixel_patch_radius,
+                self.config.subpixel_max_iterations,
+                DEFAULT_SUBPIXEL_EPSILON_PX,
+            );
+        }
 
         Ok(keypoints)
     }
@@ -1961,13 +2213,8 @@ impl PointDetector for SuperPointDetector {
     #[tracing::instrument(skip(self, luma, rois, tap), level = "debug")]
     /// Detects keypoints and descriptors for multiple frame ROIs within a single luma image.
     ///
-    /// # TODO (High-Resolution Sub-Pixel Patch Refinement)
-    /// Keypoints extracted on downscaled luma images rely on coarse grid response interpolation
-    /// when unmapped to original scan resolution ($W_{\text{orig}} \times H_{\text{orig}}$).
-    /// When epipolar reprojection residuals or focal anchor jitter require sub-0.2 px precision
-    /// on large high-res scans, sample full-resolution patches ($15 \times 15\text{ px}$) around
-    /// projected keypoints and apply localized quadratic peak interpolation (2D Taylor polynomial)
-    /// or Lucas-Kanade gradient-based photometric patch tracking.
+    /// Applies high-resolution sub-pixel patch refinement on the original full-resolution scan patches
+    /// when `subpixel_refinement` is enabled to eliminate discretization errors from downscaled grid inference.
     fn detect_luma_all(
         &self,
         luma: &ScaledLumaImage,
@@ -1980,7 +2227,8 @@ impl PointDetector for SuperPointDetector {
             scale: f32,
             scaled_w: u32,
             scaled_h: u32,
-            scaled_img: image::GrayImage,
+            scaled_img: Option<image::GrayImage>,
+            orig_img: image::GrayImage,
         }
 
         if rois.is_empty() {
@@ -2008,24 +2256,17 @@ impl PointDetector for SuperPointDetector {
             .to_image();
 
             let longest_side = pixel_rect.width.max(pixel_rect.height);
-            let (scale, scaled_w, scaled_h) = if longest_side > POINT_DETECTION_MAX_LONGEST_EDGE {
+            let (scale, scaled_w, scaled_h, scaled_img) = if longest_side
+                > POINT_DETECTION_MAX_LONGEST_EDGE
+            {
                 let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
                 let sw = (pixel_rect.width as f32 * s).round() as u32;
                 let sh = (pixel_rect.height as f32 * s).round() as u32;
-                (s, sw, sh)
+                let scaled =
+                    image::imageops::resize(&crop, sw, sh, image::imageops::FilterType::Triangle);
+                (s, sw, sh, Some(scaled))
             } else {
-                (1.0, pixel_rect.width, pixel_rect.height)
-            };
-
-            let scaled_img = if scaled_w == pixel_rect.width && scaled_h == pixel_rect.height {
-                crop
-            } else {
-                image::imageops::resize(
-                    &crop,
-                    scaled_w,
-                    scaled_h,
-                    image::imageops::FilterType::Triangle,
-                )
+                (1.0, pixel_rect.width, pixel_rect.height, None)
             };
 
             specs.push(ScaledSpec {
@@ -2035,6 +2276,7 @@ impl PointDetector for SuperPointDetector {
                 scaled_w,
                 scaled_h,
                 scaled_img,
+                orig_img: crop,
             });
         }
 
@@ -2052,10 +2294,11 @@ impl PointDetector for SuperPointDetector {
                 for spec in &specs {
                     let mut canvas_luma =
                         vec![0.0_f32; (MODEL_CANVAS_HEIGHT * MODEL_CANVAS_WIDTH) as usize];
+                    let active_img = spec.scaled_img.as_ref().unwrap_or(&spec.orig_img);
                     delegator.fill_inference_canvas(
                         &mut canvas_luma,
                         MODEL_CANVAS_WIDTH,
-                        &spec.scaled_img,
+                        active_img,
                         spec.scaled_w,
                         spec.scaled_h,
                     );
@@ -2107,11 +2350,11 @@ impl PointDetector for SuperPointDetector {
 
         let mut results = Vec::with_capacity(specs.len());
         for (b_idx, spec) in specs.into_iter().enumerate() {
-            let keypoints = if let Some(ref all_kps) = batched_results {
+            let mut keypoints = if let Some(ref all_kps) = batched_results {
                 all_kps.get(b_idx).cloned().unwrap_or_default()
             } else {
-                let float_luma: Vec<f32> = spec
-                    .scaled_img
+                let active_img = spec.scaled_img.as_ref().unwrap_or(&spec.orig_img);
+                let float_luma: Vec<f32> = active_img
                     .as_raw()
                     .iter()
                     .map(|&b| f32::from(b) / 255.0)
@@ -2137,6 +2380,16 @@ impl PointDetector for SuperPointDetector {
                     })
                     .collect()
             };
+
+            if self.config.subpixel_refinement {
+                refine_keypoints_subpixel(
+                    &spec.orig_img,
+                    &mut keypoints,
+                    self.config.subpixel_patch_radius,
+                    self.config.subpixel_max_iterations,
+                    DEFAULT_SUBPIXEL_EPSILON_PX,
+                );
+            }
 
             let frame =
                 FeatureFrame::new(spec.roi.index, spec.roi.bounds, spec.orig_size, keypoints);
@@ -2452,5 +2705,97 @@ mod tests {
         assert_eq!(triplets[0].disparity_01, 20.0);
         assert_eq!(triplets[0].disparity_12, 20.0);
         assert_eq!(triplets[0].cascade_error, 0.0);
+    }
+
+    #[test]
+    fn test_subpixel_refinement_checkerboard_corner() {
+        use image::GrayImage;
+
+        // 64x64 image with a sharp high-contrast corner at (32.0, 32.0)
+        let mut img = GrayImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                if (x < 32 && y < 32) || (x >= 32 && y >= 32) {
+                    img.put_pixel(x, y, image::Luma([240]));
+                } else {
+                    img.put_pixel(x, y, image::Luma([15]));
+                }
+            }
+        }
+
+        // Perturbed initial detection at (32.4, 31.7)
+        let mut kps = vec![KeyPoint::new(Point2D::new(32.4, 31.7), 0.99, None)];
+
+        refine_keypoints_subpixel(&img, &mut kps, 7, 5, 0.005);
+
+        // Keypoint should converge precisely to true continuous corner interface (31.5, 31.5)
+        assert!(
+            (kps[0].point.x - 31.5).abs() < 0.05,
+            "Refined X {} is not within 0.05 of true corner 31.5",
+            kps[0].point.x
+        );
+        assert!(
+            (kps[0].point.y - 31.5).abs() < 0.05,
+            "Refined Y {} is not within 0.05 of true corner 31.5",
+            kps[0].point.y
+        );
+    }
+
+    #[test]
+    fn test_subpixel_refinement_flat_and_boundary_safety() {
+        use image::GrayImage;
+
+        let flat_img = GrayImage::from_pixel(64, 64, image::Luma([128]));
+        let mut kps = vec![
+            KeyPoint::new(Point2D::new(32.0, 32.0), 0.9, None),
+            KeyPoint::new(Point2D::new(1.0, 1.0), 0.9, None), // Near border
+            KeyPoint::new(Point2D::new(63.0, 63.0), 0.9, None), // Near border
+        ];
+
+        refine_keypoints_subpixel(&flat_img, &mut kps, 7, 5, 0.01);
+
+        // Flat region and border points should remain stable without drifting or NaN
+        assert!((kps[0].point.x - 32.0).abs() < f32::EPSILON);
+        assert!((kps[0].point.y - 32.0).abs() < f32::EPSILON);
+        assert!((kps[1].point.x - 1.0).abs() < f32::EPSILON);
+        assert!((kps[1].point.y - 1.0).abs() < f32::EPSILON);
+        assert!((kps[2].point.x - 63.0).abs() < f32::EPSILON);
+        assert!((kps[2].point.y - 63.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_subpixel_refinement_config_toggle() {
+        let config_disabled = SuperPointConfig {
+            keypoint_threshold: 0.0001,
+            subpixel_refinement: false,
+            model_path: Some(PathBuf::from("/nonexistent/model.onnx")),
+            ..SuperPointConfig::default()
+        };
+        let config_enabled = SuperPointConfig {
+            keypoint_threshold: 0.0001,
+            subpixel_refinement: true,
+            model_path: Some(PathBuf::from("/nonexistent/model.onnx")),
+            ..SuperPointConfig::default()
+        };
+
+        let mut luma = vec![0.1_f32; 10000]; // 100x100
+        for y in 30..70 {
+            for x in 30..70 {
+                luma[y * 100 + x] = 0.9;
+            }
+        }
+
+        let detector_off = SuperPointDetector::new(config_disabled);
+        let detector_on = SuperPointDetector::new(config_enabled);
+
+        let kps_off = detector_off
+            .detect_luma(&luma, Size2D::new(100, 100))
+            .unwrap();
+        let kps_on = detector_on
+            .detect_luma(&luma, Size2D::new(100, 100))
+            .unwrap();
+
+        assert!(!kps_off.is_empty());
+        assert!(!kps_on.is_empty());
     }
 }
