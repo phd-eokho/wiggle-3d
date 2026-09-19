@@ -29,7 +29,10 @@ param(
     [string]$Repo = $env:WIGGLE3D_REPO,
     [Alias("Gpu")]
     [switch]$Cuda,
-    [switch]$AutoOrt
+    [switch]$AutoOrt,
+    [Alias("i")]
+    [switch]$InPlace,
+    [switch]$NoPath
 )
 
 $ErrorActionPreference = "Stop"
@@ -39,17 +42,26 @@ if (-not $Repo) {
     $Repo = "phd-eokho/wiggle-3d"
 }
 
+if ($InPlace -or ($env:WIGGLE3D_IN_PLACE -eq "1") -or ($env:WIGGLE3D_IN_PLACE -eq "true")) {
+    $InPlace = $true
+    $NoPath = $true
+    if (-not $InstallDir) {
+        $InstallDir = (Get-Location).Path
+    }
+}
+
 if (-not $InstallDir) {
-    $InstallDir = Join-Path $env:USERPROFILE ".local\bin"
+    if ($env:LOCALAPPDATA) {
+        $InstallDir = Join-Path $env:LOCALAPPDATA "Programs\reto3d"
+    } elseif ($env:APPDATA) {
+        $InstallDir = Join-Path $env:APPDATA "Programs\reto3d"
+    } else {
+        $InstallDir = Join-Path $env:USERPROFILE "AppData\Local\Programs\reto3d"
+    }
 }
 
 if (-not $LibDir) {
-    $InstallParent = Split-Path $InstallDir -Parent
-    if ($InstallParent) {
-        $LibDir = Join-Path $InstallParent "lib"
-    } else {
-        $LibDir = Join-Path $InstallDir "lib"
-    }
+    $LibDir = $InstallDir
 }
 
 if (-not $Version) {
@@ -122,6 +134,10 @@ if ($IsHelp) {
     Write-Host "                              Env: WIGGLE3D_INSTALL_DIR"
     Write-Host "  -LibDir <DIR>               Target library directory (default: $LibDir)"
     Write-Host "                              Env: WIGGLE3D_LIB_DIR"
+    Write-Host "  -InPlace, -i                Install in current directory and skip PATH update"
+    Write-Host "                              Env: WIGGLE3D_IN_PLACE=1"
+    Write-Host "  -NoPath                     Do not add install directory to user PATH"
+    Write-Host "                              Env: WIGGLE3D_NO_PATH=1"
     Write-Host "  -Version <VER>              Target release version (default: $Version)"
     Write-Host "                              Env: WIGGLE3D_VERSION"
     Write-Host "  -Repo <USER/REPO>           GitHub repository (default: $Repo)"
@@ -135,12 +151,22 @@ if ($IsHelp) {
 
 if ($IsUninstall) {
     Log-Info "Uninstalling Wiggle-3D..."
-    $CliExe = Join-Path $InstallDir "reto-cli.exe"
-    if (Test-Path $CliExe) {
-        Remove-Item -Force $CliExe
-        Log-Info "Removed binary: $CliExe"
-    } else {
-        Log-Warn "Binary $CliExe was not found."
+    $PossibleExes = @(
+        (Join-Path $InstallDir "reto-cli.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\reto3d\reto-cli.exe"),
+        (Join-Path $env:USERPROFILE ".local\bin\reto-cli.exe")
+    ) | Where-Object { $_ } | Select-Object -Unique
+
+    $FoundAny = $false
+    foreach ($ExePath in $PossibleExes) {
+        if (Test-Path $ExePath) {
+            Remove-Item -Force $ExePath -ErrorAction SilentlyContinue
+            Log-Info "Removed binary: $ExePath"
+            $FoundAny = $true
+        }
+    }
+    if (-not $FoundAny) {
+        Log-Warn "Binary reto-cli.exe was not found in standard install locations."
     }
 
     # Remove ONNX Runtime shared libraries only if provisioned by this script
@@ -164,6 +190,36 @@ if ($IsUninstall) {
 
     if (Test-Path $StateDir) {
         Remove-Item -Recurse -Force $StateDir -ErrorAction SilentlyContinue
+    }
+
+    # Remove standard program directories if empty
+    $PossibleDirs = @(
+        $InstallDir,
+        (Join-Path $env:LOCALAPPDATA "Programs\reto3d")
+    ) | Where-Object { $_ } | Select-Object -Unique
+
+    foreach ($Dir in $PossibleDirs) {
+        if ((Test-Path $Dir) -and ((Get-ChildItem -Path $Dir -Force).Count -eq 0)) {
+            Remove-Item -Recurse -Force $Dir -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Clean up user PATH
+    try {
+        $UserPath = [Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
+        if ($UserPath) {
+            $DefaultWinDir = Join-Path $env:LOCALAPPDATA "Programs\reto3d"
+            $PathParts = $UserPath -split [System.IO.Path]::PathSeparator | Where-Object {
+                $_ -and ($_ -ne $InstallDir) -and ($_ -ne $DefaultWinDir)
+            }
+            $CleanedPath = $PathParts -join [System.IO.Path]::PathSeparator
+            if ($CleanedPath -ne $UserPath) {
+                [Environment]::SetEnvironmentVariable("Path", $CleanedPath, [System.EnvironmentVariableTarget]::User)
+                Log-Info "Removed Wiggle-3D directory from user PATH."
+            }
+        }
+    } catch {
+        Log-Warn "Could not update user PATH during uninstallation."
     }
 
     Log-Info "Wiggle-3D has been successfully uninstalled."
@@ -285,23 +341,27 @@ try {
     Log-Info "Successfully installed 'reto-cli.exe' to $TargetExe"
 
     # 7. Check & Configure PATH
-    $InSessionPath = ($env:PATH -split [System.IO.Path]::PathSeparator) -contains $InstallDir
-    $UserPath = [Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
-    $InUserPath = ($UserPath -split [System.IO.Path]::PathSeparator) -contains $InstallDir
+    if (-not $NoPath -and -not ($env:WIGGLE3D_NO_PATH -eq "1" -or $env:WIGGLE3D_NO_PATH -eq "true")) {
+        $InSessionPath = ($env:PATH -split [System.IO.Path]::PathSeparator) -contains $InstallDir
+        $UserPath = [Environment]::GetEnvironmentVariable("Path", [System.EnvironmentVariableTarget]::User)
+        $InUserPath = ($UserPath -split [System.IO.Path]::PathSeparator) -contains $InstallDir
 
-    if (-not $InUserPath) {
-        try {
-            $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
-            [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [System.EnvironmentVariableTarget]::User)
+        if (-not $InUserPath) {
+            try {
+                $NewUserPath = if ([string]::IsNullOrEmpty($UserPath)) { $InstallDir } else { "$UserPath;$InstallDir" }
+                [Environment]::SetEnvironmentVariable("Path", $NewUserPath, [System.EnvironmentVariableTarget]::User)
+                $env:PATH = "$env:PATH;$InstallDir"
+                Log-Info "Added $InstallDir to user PATH."
+            } catch {
+                Log-Warn "$InstallDir is not in your PATH."
+                Write-Host "  Add it to your user PATH with:"
+                Write-Host "    [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$InstallDir', 'User')`n"
+            }
+        } elseif (-not $InSessionPath) {
             $env:PATH = "$env:PATH;$InstallDir"
-            Log-Info "Added $InstallDir to user PATH."
-        } catch {
-            Log-Warn "$InstallDir is not in your PATH."
-            Write-Host "  Add it to your user PATH with:"
-            Write-Host "    [Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path', 'User') + ';$InstallDir', 'User')`n"
         }
-    } elseif (-not $InSessionPath) {
-        $env:PATH = "$env:PATH;$InstallDir"
+    } else {
+        Log-Info "Skipping PATH modifications as requested."
     }
 
     # 8. Verify ONNX Runtime Dependency & Setup

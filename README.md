@@ -78,7 +78,7 @@ $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
 ```
 
-The installer downloads the pre-built binary (`reto-cli` / `reto-cli.exe`) to `~/.local/bin/` and automatically configures the required ONNX Runtime dynamic libraries.
+The installer installs the pre-built CLI binary (`~/.local/bin/reto-cli` on Linux/macOS or `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe` on Windows) and automatically configures the required ONNX Runtime dynamic libraries.
 
 #### Build from Source (Developers)
 
