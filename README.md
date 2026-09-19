@@ -48,26 +48,42 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 
 #### 1-Line Standalone Installer (Recommended)
 
+**Linux / macOS:**
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
 
 For NVIDIA GPU acceleration (CUDA):
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
+curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
 
-The installer downloads the pre-built binary to `~/.local/bin/reto-cli` and automatically configures the required ONNX Runtime libraries in `~/.local/lib/`.
-
-*To uninstall:*
+*To uninstall (Linux / macOS):*
 ```bash
-curl -fsSL https://raw.githubusercontent.com/DeokhoKim/wiggle-3d/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh -s -- --uninstall
 ```
+
+**Windows (PowerShell):**
+```powershell
+irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
+```
+
+For NVIDIA GPU acceleration (CUDA):
+```powershell
+$env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
+```
+
+*To uninstall (Windows):*
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
+```
+
+The installer downloads the pre-built binary (`reto-cli` / `reto-cli.exe`) to `~/.local/bin/` and automatically configures the required ONNX Runtime dynamic libraries.
 
 #### Build from Source (Developers)
 
 ```bash
-git clone https://github.com/DeokhoKim/wiggle-3d.git
+git clone https://github.com/phd-eokho/wiggle-3d.git
 cd wiggle-3d
 cargo build --release
 ```
