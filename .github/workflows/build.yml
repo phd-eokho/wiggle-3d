@@ -76,6 +76,7 @@ jobs:
           DIST_DIR=$(mktemp -d)
           echo "DIST_DIR=${DIST_DIR}" >> "$GITHUB_ENV"
           PKG_NAME="${{ github.ref_name }}"
+          PKG_NAME="${PKG_NAME//\//-}"
           [ -z "$PKG_NAME" ] && PKG_NAME="${{ github.sha }}"
           STAGE_DIR="${DIST_DIR}/wiggle-3d-${PKG_NAME}-linux-x86_64"
           mkdir -p "${STAGE_DIR}"
@@ -128,7 +129,8 @@ jobs:
         run: |
           $DistDir = New-Item -ItemType Directory -Path (Join-Path $env:RUNNER_TEMP "dist")
           echo "DIST_DIR=$($DistDir.FullName)" >> $env:GITHUB_ENV
-          $PkgName = if ("${{ github.ref_name }}") { "${{ github.ref_name }}" } else { "${{ github.sha }}" }
+          $RawName = "${{ github.ref_name }}"
+          $PkgName = if ($RawName) { $RawName -replace '[\\/]', '-' } else { "${{ github.sha }}" }
           $StageDir = New-Item -ItemType Directory -Path (Join-Path $DistDir.FullName "wiggle-3d-$PkgName-windows-x86_64")
           Copy-Item target/release/reto-cli.exe $StageDir.FullName
           if (Test-Path README.md) { Copy-Item README.md $StageDir.FullName }
