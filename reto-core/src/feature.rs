@@ -522,6 +522,35 @@ impl BackendDevice {
     }
 }
 
+/// Status of localized sub-pixel gradient tensor refinement for a keypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum SubpixelStatus {
+    /// Initial neural coordinate without refinement attempt.
+    #[default]
+    NeuralOnly,
+    /// Successfully converged to a sub-pixel location.
+    Refined {
+        /// Sub-pixel displacement vector (dx, dy) in pixels.
+        delta: (f32, f32),
+        /// Number of gradient descent iterations performed.
+        iterations: usize,
+    },
+    /// Sub-pixel refinement exceeded maximum drift threshold; reverted to neural coordinate.
+    DriftRejected {
+        /// Attempted displacement magnitude in pixels that caused rejection.
+        drift_px: f32,
+    },
+    /// Structure tensor was ill-conditioned (1D aperture edge or low texture); skipped refinement.
+    PoorConditioning {
+        /// Minimum eigenvalue of the spatial structure tensor.
+        min_eigenvalue: f32,
+        /// Conditioning ratio lambda_min / lambda_max.
+        cond_ratio: f32,
+    },
+    /// Keypoint lies too close to image boundary to extract full patch.
+    BoundarySkipped,
+}
+
 /// A 2D feature keypoint with sub-pixel coordinates, confidence score, and optional descriptor vector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyPoint {
@@ -531,6 +560,8 @@ pub struct KeyPoint {
     pub score: f32,
     /// High-dimensional descriptor vector (e.g. 256 dimensions for `SuperPoint`).
     pub descriptor: Option<Vec<f32>>,
+    /// Status and metadata of localized sub-pixel gradient refinement.
+    pub subpixel_status: SubpixelStatus,
 }
 
 impl KeyPoint {
@@ -542,6 +573,24 @@ impl KeyPoint {
             point,
             score,
             descriptor,
+            subpixel_status: SubpixelStatus::NeuralOnly,
+        }
+    }
+
+    /// Constructs a new `KeyPoint` with explicit sub-pixel refinement status.
+    #[inline]
+    #[must_use]
+    pub const fn with_subpixel_status(
+        point: Point2D<f32>,
+        score: f32,
+        descriptor: Option<Vec<f32>>,
+        subpixel_status: SubpixelStatus,
+    ) -> Self {
+        Self {
+            point,
+            score,
+            descriptor,
+            subpixel_status,
         }
     }
 }
@@ -591,7 +640,42 @@ impl FeatureFrame {
     }
 }
 
-/// Match correspondence between two keypoint indices.
+/// Detailed descriptor matching score and geometric agreement metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MatchScore {
+    /// Raw descriptor cosine similarity / correlation score in `[-1.0, 1.0]`.
+    pub similarity: f32,
+    /// Normalized matching confidence score in `[0.0, 1.0]`.
+    pub confidence: f32,
+    /// Nearest neighbor distance ratio (Lowe's ratio test: d1 / d2), if computed.
+    pub distance_ratio: Option<f32>,
+}
+
+impl MatchScore {
+    /// Constructs a `MatchScore` from a normalized confidence score.
+    #[inline]
+    #[must_use]
+    pub const fn from_confidence(confidence: f32) -> Self {
+        Self {
+            similarity: confidence,
+            confidence,
+            distance_ratio: None,
+        }
+    }
+
+    /// Constructs a detailed `MatchScore` with similarity and distance ratio.
+    #[inline]
+    #[must_use]
+    pub const fn new(similarity: f32, confidence: f32, distance_ratio: Option<f32>) -> Self {
+        Self {
+            similarity,
+            confidence,
+            distance_ratio,
+        }
+    }
+}
+
+/// Match correspondence between two keypoint indices with structured confidence.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FeatureMatch {
     /// Index of the keypoint in frame A.
@@ -600,6 +684,8 @@ pub struct FeatureMatch {
     pub index_b: usize,
     /// Matching confidence or similarity score.
     pub confidence: f32,
+    /// Detailed matching score metadata.
+    pub score: MatchScore,
 }
 
 impl FeatureMatch {
@@ -611,6 +697,19 @@ impl FeatureMatch {
             index_a,
             index_b,
             confidence,
+            score: MatchScore::from_confidence(confidence),
+        }
+    }
+
+    /// Constructs a `FeatureMatch` with detailed `MatchScore`.
+    #[inline]
+    #[must_use]
+    pub const fn with_score(index_a: usize, index_b: usize, score: MatchScore) -> Self {
+        Self {
+            index_a,
+            index_b,
+            confidence: score.confidence,
+            score,
         }
     }
 }
@@ -705,14 +804,8 @@ pub struct FeatureTriplet {
 
 /// Boundary condition configuration for rigid chassis cascaded transform and depth consistency.
 ///
-/// # TODO (Lens Distortion Modeling)
-/// Uncalibrated optical distortion from low-cost multi-lens plastic toy cameras (such as RETO 3D,
-/// Nimslo, Nishika) causes non-linear peripheral curvature mismatch near outer boundaries.
-/// When multi-view reprojection residual errors across outer frame boundaries exceed `0.5 px`,
-/// incorporate per-lens radial ($k_1, k_2$) and tangential ($p_1, p_2$) distortion parameters
-/// into joint bundle adjustment self-calibration:
-/// - $x_d = x(1 + k_1 r^2 + k_2 r^4) + 2 p_1 x y + p_2(r^2 + 2 x^2)$
-/// - $y_d = y(1 + k_1 r^2 + k_2 r^4) + p_1(r^2 + 2 y^2) + 2 p_2 x y$
+/// Encapsulates geometric thresholds for multi-view loop closure verification and
+/// cross-baseline jitter tolerances across adjacent sub-frames.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TripletConsistencyConfig {
     /// Nominal baseline ratio $B_{01} / B_{12}$ (1.0 for symmetric baseline).
@@ -725,6 +818,8 @@ pub struct TripletConsistencyConfig {
     pub max_cascade_error_px: f32,
     /// Minimum disparity in pixels to avoid division by zero on points at optical infinity.
     pub min_disparity_px: f32,
+    /// Radial boundary slack scaling factor for outer image regions (e.g. 1.5 relaxes tolerance up to 2.5x at corners).
+    pub radial_slack_factor: f32,
     /// Strip orientation (horizontal vs vertical frame layout).
     pub orientation: StripOrientation,
 }
@@ -737,6 +832,7 @@ impl Default for TripletConsistencyConfig {
             max_cross_baseline_jitter_px: 25.0,
             max_cascade_error_px: 5.0,
             min_disparity_px: 0.1,
+            radial_slack_factor: 1.5,
             orientation: StripOrientation::Horizontal,
         }
     }
@@ -753,6 +849,7 @@ impl TripletConsistencyConfig {
             max_cross_baseline_jitter_px: 25.0,
             max_cascade_error_px: 5.0,
             min_disparity_px: 0.1,
+            radial_slack_factor: 1.5,
             orientation,
         }
     }
@@ -766,6 +863,7 @@ impl TripletConsistencyConfig {
     ///
     /// # Returns
     /// `Some((disparity_01, disparity_12, cascade_error))` if inlier, else `None`.
+    #[inline]
     #[must_use]
     pub fn verify_triplet(
         &self,
@@ -773,32 +871,74 @@ impl TripletConsistencyConfig {
         pt1: Point2D<f32>,
         pt2: Point2D<f32>,
     ) -> Option<(f32, f32, f32)> {
+        self.verify_triplet_with_bounds(pt0, pt1, pt2, None)
+    }
+
+    /// Verifies if a candidate feature triplet satisfies the rigid cascaded transform boundary condition,
+    /// with optional radius-dependent boundary slack expansion for uncalibrated wide-angle distortion.
+    ///
+    /// # Arguments
+    /// * `pt0` - 2D coordinate in Frame 0.
+    /// * `pt1` - 2D coordinate in Frame 1.
+    /// * `pt2` - 2D coordinate in Frame 2.
+    /// * `frame_size` - Optional dimensions of the sub-frame to compute normalized radius.
+    ///
+    /// # Returns
+    /// `Some((disparity_01, disparity_12, cascade_error))` if inlier, else `None`.
+    #[must_use]
+    #[allow(clippy::suboptimal_flops, clippy::cast_precision_loss)]
+    pub fn verify_triplet_with_bounds(
+        &self,
+        pt0: Point2D<f32>,
+        pt1: Point2D<f32>,
+        pt2: Point2D<f32>,
+        frame_size: Option<Size2D<u32>>,
+    ) -> Option<(f32, f32, f32)> {
         // Project onto baseline axis (parallax) and orthogonal cross-baseline axis (epipolar jitter)
         let (p0_base, p0_cross, p1_base, p1_cross, p2_base, p2_cross) = match self.orientation {
             StripOrientation::Horizontal => (pt0.x, pt0.y, pt1.x, pt1.y, pt2.x, pt2.y),
             StripOrientation::Vertical => (pt0.y, pt0.x, pt1.y, pt1.x, pt2.y, pt2.x),
         };
 
+        // Compute radial boundary slack multiplier if frame size is provided
+        let slack = frame_size.map_or(1.0_f32, |sz| {
+            let cx = sz.width as f32 * 0.5;
+            let cy = sz.height as f32 * 0.5;
+            let r_max_sq = cx * cx + cy * cy;
+            if r_max_sq > 1e-3 {
+                let dx = pt0.x - cx;
+                let dy = pt0.y - cy;
+                let r_norm_sq = (dx * dx + dy * dy) / r_max_sq;
+                1.0 + self.radial_slack_factor * r_norm_sq.min(1.0)
+            } else {
+                1.0
+            }
+        });
+
+        let eff_max_cross_jitter = self.max_cross_baseline_jitter_px * slack;
+        let eff_max_cascade_err = self.max_cascade_error_px * slack;
+
         // 1. Cross-baseline jitter bound across all view pairs
         let d_cross_01 = (p0_cross - p1_cross).abs();
         let d_cross_12 = (p1_cross - p2_cross).abs();
         let d_cross_02 = (p0_cross - p2_cross).abs();
-        if d_cross_01 > self.max_cross_baseline_jitter_px
-            || d_cross_12 > self.max_cross_baseline_jitter_px
-            || d_cross_02 > self.max_cross_baseline_jitter_px
+        if d_cross_01 > eff_max_cross_jitter
+            || d_cross_12 > eff_max_cross_jitter
+            || d_cross_02 > eff_max_cross_jitter
         {
             return None;
         }
 
-        // 2. Collinear along-baseline disparity calculation
+        // 2. Collinear along-baseline disparity calculation across all 3 view combinations
         let raw_disp_01 = p0_base - p1_base;
         let raw_disp_12 = p1_base - p2_base;
         let raw_disp_02 = p0_base - p2_base;
 
         let disp_01 = raw_disp_01.abs();
         let disp_12 = raw_disp_12.abs();
+        let disp_02 = raw_disp_02.abs();
 
-        // Direction check: only enforce when disparity is well above unrectified mounting jitter
+        // Direction check across all pairs: enforce sign consistency when above unrectified mounting jitter
         let noise_floor = 4.0_f32;
         if disp_01 > noise_floor
             && disp_12 > noise_floor
@@ -806,14 +946,1087 @@ impl TripletConsistencyConfig {
         {
             return None;
         }
+        if disp_02 > noise_floor
+            && disp_01 > noise_floor
+            && (raw_disp_02.signum() - raw_disp_01.signum()).abs() > 0.01
+        {
+            return None;
+        }
 
-        // 3. Cascaded transform additivity: T_02 = T_12 * T_01 => raw_disp_02 ≈ raw_disp_01 + raw_disp_12
+        // 3. Cascaded baseline transform additivity: T_02 = T_12 * T_01 => raw_disp_02 ≈ raw_disp_01 + raw_disp_12
         let cascade_error = (raw_disp_02 - (raw_disp_01 + raw_disp_12)).abs();
-        if cascade_error > self.max_cascade_error_px {
+        if cascade_error > eff_max_cascade_err {
             return None;
         }
 
         Some((disp_01, disp_12, cascade_error))
+    }
+}
+
+/// Pruning / validation status of a dyadic reduction tree branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BranchStatus {
+    /// Branch is valid, active, and included in extrinsic optimization.
+    #[default]
+    Active,
+    /// Branch failed chord consistency check (residual exceeds threshold) and is pruned to prevent corrupting the tree.
+    Pruned,
+    /// Branch has zero direct correspondence observations and was synthesized from child spans.
+    Synthesized,
+}
+
+/// A dyadic interval span in the hierarchical reduction tree across 1D adjacent camera frames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DyadicSpan {
+    /// Starting frame index $i$.
+    pub start_frame: usize,
+    /// Ending frame index $k$.
+    pub end_frame: usize,
+    /// Midpoint partition frame index $j$ where the span is recursively decomposed.
+    pub mid_frame: usize,
+    /// Tree depth level (0 for adjacent leaves with stride 1, 1 for stride 2, etc.).
+    pub level: usize,
+    /// Observed relative translation `(along_baseline_dx, cross_baseline_dy)` from direct feature matches in pixels.
+    pub observed_translation: (f32, f32),
+    /// Composed relative translation `(along_baseline_dx, cross_baseline_dy)` from child spans in pixels.
+    pub composed_translation: (f32, f32),
+    /// Hierarchical chord closure residual error in pixels `|observed - composed|`.
+    pub chord_residual_px: f32,
+    /// Number of pairwise feature correspondences anchoring this span.
+    pub match_count: usize,
+    /// Branch validation and pruning status.
+    pub status: BranchStatus,
+}
+
+/// Detailed before/after root-mean-square error (RMSE) metric and relative improvement tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct RmseMetric {
+    /// Initial root-mean-square chord consistency error in pixels prior to optimization.
+    pub before: f32,
+    /// Final root-mean-square residual error in pixels following optimization.
+    pub after: f32,
+    /// Relative residual error reduction percentage: `(before - after) / before * 100.0`.
+    pub improvement_pct: f32,
+}
+
+impl RmseMetric {
+    /// Creates a new `RmseMetric` and calculates relative improvement percentage.
+    #[must_use]
+    pub fn new(before: f32, after: f32) -> Self {
+        let improvement_pct = if before > 1e-4 {
+            ((before - after) / before) * 100.0
+        } else {
+            0.0
+        };
+        Self {
+            before,
+            after,
+            improvement_pct,
+        }
+    }
+}
+
+/// Defensive fallback status of hierarchical reduction tree optimization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FallbackStatus {
+    /// Optimization converged successfully within tolerances.
+    #[default]
+    None,
+    /// Defensive fallback was triggered to revert to safe nominal initial baseline.
+    Triggered {
+        /// Human-readable explanation describing the cause of fallback triggering.
+        reason: String,
+    },
+}
+
+impl FallbackStatus {
+    /// Returns `true` if defensive fallback was triggered.
+    #[must_use]
+    pub const fn is_triggered(&self) -> bool {
+        matches!(self, Self::Triggered { .. })
+    }
+
+    /// Returns the human-readable explanation if fallback was triggered.
+    #[must_use]
+    pub const fn reason(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Triggered { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Numerical error tolerances and gating thresholds for hierarchical extrinsic optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExtrinsicsTolerance {
+    /// Maximum allowed branch chord closure discrepancy in pixels before branch is quarantined/pruned.
+    pub max_branch_residual_px: f32,
+    /// Maximum acceptable post-optimization RMSE in pixels before triggering safe fallback.
+    pub max_acceptable_rmse_px: f32,
+    /// Enforces along-baseline camera ordering monotonicity to prevent inverted chassis geometries.
+    pub enforce_monotonicity: bool,
+}
+
+impl Default for ExtrinsicsTolerance {
+    fn default() -> Self {
+        Self {
+            max_branch_residual_px: 15.0,
+            max_acceptable_rmse_px: 25.0,
+            enforce_monotonicity: true,
+        }
+    }
+}
+
+/// Detailed diagnostic report comparing camera array extrinsics and residual errors before and after hierarchical optimization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HierarchicalOptimizationReport {
+    /// Number of camera frames in the 1D sequential array.
+    pub num_cameras: usize,
+    /// Root-mean-square error (RMSE) before and after optimization.
+    pub rmse_px: RmseMetric,
+    /// Optimized camera positions `(along_baseline_x, cross_baseline_y)` relative to Camera 0 at `(0, 0)`.
+    pub camera_positions: Vec<(f32, f32)>,
+    /// Optimized relative translations between adjacent lenses `(0->1, 1->2, ..., N-2->N-1)`.
+    pub adjacent_translations: Vec<(f32, f32)>,
+    /// Vertical sag of interior lenses relative to the straight chord connecting Camera 0 and Camera N-1.
+    pub center_sags_px: Vec<f32>,
+    /// Per-level root-mean-square residual errors in pixels across reduction tree levels.
+    pub level_rmse_px: Vec<f32>,
+    /// Diagnostic records for all dyadic spans evaluated in the reduction tree.
+    pub dyadic_spans: Vec<DyadicSpan>,
+    /// Defensive fallback status.
+    pub fallback: FallbackStatus,
+    /// Number of discordant tree branches pruned prior to or during optimization.
+    pub pruned_branches: usize,
+}
+
+/// Configuration for the hierarchical reduction tree and joint extrinsic optimizer.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HierarchicalExtrinsicsConfig {
+    /// Huber loss threshold for robust outlier downweighting in pixels (e.g. 2.0 px).
+    pub huber_threshold_px: f32,
+    /// Regularization weight for hierarchical chord closure consistency constraints.
+    pub chord_consistency_weight: f32,
+    /// Defensive validation tolerances and fallback thresholds.
+    pub tolerance: ExtrinsicsTolerance,
+    /// Maximum optimization iterations for IRLS (Iteratively Reweighted Least Squares).
+    pub max_iterations: usize,
+    /// Convergence tolerance on parameter update norm.
+    pub convergence_epsilon: f32,
+}
+
+impl Default for HierarchicalExtrinsicsConfig {
+    fn default() -> Self {
+        Self {
+            huber_threshold_px: 2.0,
+            chord_consistency_weight: 1.0,
+            tolerance: ExtrinsicsTolerance::default(),
+            max_iterations: 10,
+            convergence_epsilon: 1e-4,
+        }
+    }
+}
+
+/// Maximum supported camera array parameters for stack-allocated dense linear solvers ($N \le 32$).
+pub const MAX_CAMERA_ARRAY_VARS: usize = 32;
+
+// NOTE: Multi-lens camera rigs (e.g. 3-lens, 4-lens, or up to 32-lens sequential arrays)
+// are strictly bounded by N <= 32. We utilize stack-allocated flat row-major buffers [f32; 1024]
+// to guarantee O(1) heap allocations, maximal L1/L2 cache locality, and auto-vectorization.
+// For theoretical arrays N > 32, a dynamic heap fallback pathway is provided.
+
+/// Solves a small dense linear system `A * x = b` of dimension `n <= 32` using Gaussian elimination with partial pivoting.
+///
+/// Operates entirely on flat contiguous stack memory with zero dynamic heap allocations.
+#[inline]
+#[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
+fn solve_linear_system_stack(
+    n: usize,
+    a_flat: &[f32],
+    b_in: &[f32],
+) -> Option<[f32; MAX_CAMERA_ARRAY_VARS]> {
+    if n == 0 || n > MAX_CAMERA_ARRAY_VARS || a_flat.len() < n * n || b_in.len() < n {
+        return None;
+    }
+    let mut a = [0.0_f32; MAX_CAMERA_ARRAY_VARS * MAX_CAMERA_ARRAY_VARS];
+    a[..n * n].copy_from_slice(&a_flat[..n * n]);
+
+    let mut b = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+    b[..n].copy_from_slice(&b_in[..n]);
+
+    for i in 0..n {
+        let mut max_row = i;
+        let mut max_val = a[i * n + i].abs();
+        for k in (i + 1)..n {
+            let val = a[k * n + i].abs();
+            if val > max_val {
+                max_val = val;
+                max_row = k;
+            }
+        }
+        if max_val < 1e-12 {
+            return None;
+        }
+        if max_row != i {
+            for j in 0..n {
+                a.swap(i * n + j, max_row * n + j);
+            }
+            b.swap(i, max_row);
+        }
+        let pivot = a[i * n + i];
+        let inv_pivot = 1.0 / pivot;
+        for k in (i + 1)..n {
+            let factor = a[k * n + i] * inv_pivot;
+            for j in i..n {
+                a[k * n + j] -= factor * a[i * n + j];
+            }
+            b[k] -= factor * b[i];
+            a[k * n + i] = 0.0;
+        }
+    }
+
+    let mut x = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+    for i in (0..n).rev() {
+        let mut sum = b[i];
+        for j in (i + 1)..n {
+            // Note (FMA vs Portability): Standard subtraction `sum -= a * x` is used for algorithmic
+            // readability and LLVM auto-vectorization. If explicit hardware FMA (`mul_add`) is adopted in
+            // future optimizations, ensure target architecture support (AVX2/NEON) to avoid libm `fmaf` emulation.
+            sum -= a[i * n + j] * x[j];
+        }
+        x[i] = sum / a[i * n + i];
+    }
+    Some(x)
+}
+
+/// Hierarchical binary reduction tree for $O(N \log N)$ multi-lens camera array extrinsic optimization.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HierarchicalReductionTree {
+    /// Number of camera frames in the sequential 1D array.
+    pub num_frames: usize,
+    /// Tree levels containing dyadic spans grouped by stride ($2^h$).
+    pub spans: Vec<DyadicSpan>,
+}
+
+impl HierarchicalReductionTree {
+    /// Builds a hierarchical reduction tree from observed pairwise matches and frame coordinates.
+    ///
+    /// # Arguments
+    /// * `frames` - Slice of feature frames ($N \ge 2$).
+    /// * `match_sets` - Slice of pairwise match sets between frame pairs.
+    /// * `orientation` - Scan strip layout orientation.
+    ///
+    /// # Returns
+    /// Constructed `HierarchicalReductionTree` with initial observation stats and child compositions.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::similar_names,
+        clippy::too_many_lines,
+        clippy::imprecise_flops
+    )]
+    pub fn build_from_match_sets(
+        frames: &[FeatureFrame],
+        match_sets: &[PairwiseMatchSet],
+        orientation: StripOrientation,
+    ) -> Self {
+        let n = frames.len();
+        if n < 2 {
+            return Self {
+                num_frames: n,
+                spans: Vec::new(),
+            };
+        }
+
+        // Map pairwise matches by (min(a,b), max(a,b)) -> ((med_base, med_cross), count)
+        let mut obs_map: HashMap<(usize, usize), ((f32, f32), usize)> = HashMap::new();
+        for ms in match_sets {
+            let (f_a, f_b) = ms.pair;
+            if f_a >= n || f_b >= n || f_a == f_b {
+                continue;
+            }
+            let (src, dst) = if f_a < f_b { (f_a, f_b) } else { (f_b, f_a) };
+            let mut d_base = Vec::with_capacity(ms.matches.len());
+            let mut d_cross = Vec::with_capacity(ms.matches.len());
+
+            for m in &ms.matches {
+                let (idx_src, idx_dst) = if f_a < f_b {
+                    (m.index_a, m.index_b)
+                } else {
+                    (m.index_b, m.index_a)
+                };
+                if idx_src < frames[src].keypoints.len() && idx_dst < frames[dst].keypoints.len() {
+                    let ps = frames[src].keypoints[idx_src].point;
+                    let pd = frames[dst].keypoints[idx_dst].point;
+                    let (ps_b, ps_c, pd_b, pd_c) = match orientation {
+                        StripOrientation::Horizontal => (ps.x, ps.y, pd.x, pd.y),
+                        StripOrientation::Vertical => (ps.y, ps.x, pd.y, pd.x),
+                    };
+                    d_base.push(ps_b - pd_b);
+                    d_cross.push(pd_c - ps_c);
+                }
+            }
+
+            if !d_base.is_empty() {
+                let med_b = compute_median(&mut d_base);
+                let med_c = compute_median(&mut d_cross);
+                obs_map.insert((src, dst), ((med_b, med_c), d_base.len()));
+            }
+        }
+
+        // Generate dyadic spans across levels
+        let mut spans = Vec::new();
+        let mut stride = 1usize;
+        let mut level = 0usize;
+
+        while stride < n {
+            for i in 0..n {
+                let k = i + stride;
+                if k >= n {
+                    break;
+                }
+                let mid = i + stride / 2;
+                let (obs, count) = obs_map.get(&(i, k)).copied().unwrap_or(((0.0, 0.0), 0));
+                let status = if count > 0 {
+                    BranchStatus::Active
+                } else {
+                    BranchStatus::Synthesized
+                };
+                spans.push(DyadicSpan {
+                    start_frame: i,
+                    end_frame: k,
+                    mid_frame: mid,
+                    level,
+                    observed_translation: obs,
+                    composed_translation: (0.0, 0.0),
+                    chord_residual_px: 0.0,
+                    match_count: count,
+                    status,
+                });
+            }
+            stride *= 2;
+            level += 1;
+        }
+
+        // Ensure root span (0, n-1) is included
+        if n > 2
+            && !spans
+                .iter()
+                .any(|s| s.start_frame == 0 && s.end_frame == n - 1)
+        {
+            let mid = n / 2;
+            let (obs, count) = obs_map.get(&(0, n - 1)).copied().unwrap_or(((0.0, 0.0), 0));
+            let status = if count > 0 {
+                BranchStatus::Active
+            } else {
+                BranchStatus::Synthesized
+            };
+            spans.push(DyadicSpan {
+                start_frame: 0,
+                end_frame: n - 1,
+                mid_frame: mid,
+                level,
+                observed_translation: obs,
+                composed_translation: (0.0, 0.0),
+                chord_residual_px: 0.0,
+                match_count: count,
+                status,
+            });
+        }
+
+        // Compute bottom-up composed translations and chord residuals
+        let mut span_val_map: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+        // First populate level 0 (leaves)
+        for s in &mut spans {
+            if s.level == 0 {
+                s.composed_translation = s.observed_translation;
+                span_val_map.insert((s.start_frame, s.end_frame), s.observed_translation);
+            }
+        }
+
+        // Then compute higher levels
+        for s in &mut spans {
+            if s.level > 0 {
+                let t_left = span_val_map
+                    .get(&(s.start_frame, s.mid_frame))
+                    .copied()
+                    .unwrap_or_default();
+                let t_right = span_val_map
+                    .get(&(s.mid_frame, s.end_frame))
+                    .copied()
+                    .unwrap_or_default();
+                let comp = (t_left.0 + t_right.0, t_left.1 + t_right.1);
+                s.composed_translation = comp;
+                span_val_map.insert((s.start_frame, s.end_frame), comp);
+
+                if s.match_count > 0 {
+                    let d0 = s.observed_translation.0 - comp.0;
+                    let d1 = s.observed_translation.1 - comp.1;
+                    s.chord_residual_px = d0.hypot(d1);
+                } else {
+                    s.observed_translation = comp;
+                    s.chord_residual_px = 0.0;
+                }
+            }
+        }
+
+        Self {
+            num_frames: n,
+            spans,
+        }
+    }
+
+    /// Optimizes camera array extrinsics and chord consistency using robust Iteratively Reweighted Least Squares (IRLS).
+    ///
+    /// # Arguments
+    /// * `config` - Optimization parameters and Huber loss gating settings.
+    ///
+    /// # Returns
+    /// A [`HierarchicalOptimizationReport`] containing before/after RMSE, relative improvement,
+    /// optimized camera positions, center sags, and defensive fallback diagnostics.
+    #[must_use]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::similar_names,
+        clippy::suboptimal_flops,
+        clippy::too_many_lines,
+        clippy::imprecise_flops
+    )]
+    pub fn optimize(
+        &self,
+        config: &HierarchicalExtrinsicsConfig,
+    ) -> HierarchicalOptimizationReport {
+        let n = self.num_frames;
+        if n < 2 || self.spans.is_empty() {
+            return HierarchicalOptimizationReport {
+                num_cameras: n,
+                rmse_px: RmseMetric::default(),
+                camera_positions: vec![(0.0, 0.0); n],
+                adjacent_translations: vec![(0.0, 0.0); n.saturating_sub(1)],
+                center_sags_px: vec![0.0; n.saturating_sub(2)],
+                level_rmse_px: Vec::new(),
+                dyadic_spans: self.spans.clone(),
+                fallback: FallbackStatus::None,
+                pruned_branches: 0,
+            };
+        }
+
+        // 1. Pre-optimization screening and branch pruning
+        let mut active_spans = self.spans.clone();
+        let mut pruned_branches_count = 0usize;
+        let mut max_level = 0usize;
+
+        for s in &mut active_spans {
+            max_level = max_level.max(s.level);
+            if s.level > 0
+                && s.match_count > 0
+                && s.chord_residual_px > config.tolerance.max_branch_residual_px
+            {
+                s.status = BranchStatus::Pruned;
+                pruned_branches_count += 1;
+                tracing::warn!(
+                    span = ?(s.start_frame, s.end_frame),
+                    chord_residual_px = s.chord_residual_px,
+                    threshold_px = config.tolerance.max_branch_residual_px,
+                    "Pruned discordant hierarchical reduction tree branch to prevent optimization contamination"
+                );
+            }
+        }
+
+        // Evaluate pre-optimization RMSE across non-leaf non-pruned dyadic spans
+        let mut pre_sq_err = 0.0_f32;
+        let mut pre_count = 0usize;
+        for s in &active_spans {
+            if s.level > 0 && s.match_count > 0 && s.status != BranchStatus::Pruned {
+                pre_sq_err += s.chord_residual_px * s.chord_residual_px;
+                pre_count += 1;
+            }
+        }
+        let rmse_before_px = if pre_count > 0 {
+            (pre_sq_err / pre_count as f32).sqrt()
+        } else {
+            0.0
+        };
+
+        // 2. Initialize safe baseline from adjacent level 0 leaves
+        let num_vars = n - 1;
+        let mut initial_pos_x = vec![0.0_f32; n];
+        let mut initial_pos_y = vec![0.0_f32; n];
+
+        for s in &active_spans {
+            if s.level == 0 && s.start_frame + 1 == s.end_frame {
+                initial_pos_x[s.end_frame] =
+                    initial_pos_x[s.start_frame] + s.observed_translation.0;
+                initial_pos_y[s.end_frame] =
+                    initial_pos_y[s.start_frame] + s.observed_translation.1;
+            }
+        }
+
+        let mut pos_x = initial_pos_x.clone();
+        let mut pos_y = initial_pos_y.clone();
+
+        let delta = config.huber_threshold_px.max(0.1);
+        let mut solver_failed = false;
+
+        // Run IRLS iterations
+        for _iter in 0..config.max_iterations {
+            let mut u_x = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+            let mut u_y = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+
+            for coord in 0..2 {
+                let mut h_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS * MAX_CAMERA_ARRAY_VARS];
+                let mut g_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+
+                // Tikhonov damping for numerical stability
+                for i in 0..num_vars {
+                    h_flat[i * num_vars + i] += 1e-6;
+                }
+
+                // Accumulate direct observed constraints (skipping pruned branches)
+                for s in &active_spans {
+                    if s.match_count == 0 || s.status == BranchStatus::Pruned {
+                        continue;
+                    }
+                    let target = if coord == 0 {
+                        s.observed_translation.0
+                    } else {
+                        s.observed_translation.1
+                    };
+                    let cur_pred = if coord == 0 {
+                        pos_x[s.end_frame] - pos_x[s.start_frame]
+                    } else {
+                        pos_y[s.end_frame] - pos_y[s.start_frame]
+                    };
+                    let r = (cur_pred - target).abs();
+                    let huber_w = if r <= delta { 1.0 } else { delta / r };
+                    let w = (s.match_count as f32).sqrt() * huber_w;
+
+                    let idx_end = if s.end_frame > 0 {
+                        Some(s.end_frame - 1)
+                    } else {
+                        None
+                    };
+                    let idx_start = if s.start_frame > 0 {
+                        Some(s.start_frame - 1)
+                    } else {
+                        None
+                    };
+
+                    if let Some(ie) = idx_end {
+                        g_flat[ie] += w * target;
+                        h_flat[ie * num_vars + ie] += w;
+                    }
+                    if let Some(is) = idx_start {
+                        g_flat[is] -= w * target;
+                        h_flat[is * num_vars + is] += w;
+                    }
+                    if let (Some(ie), Some(is)) = (idx_end, idx_start) {
+                        h_flat[ie * num_vars + is] -= w;
+                        h_flat[is * num_vars + ie] -= w;
+                    }
+                }
+
+                // Accumulate hierarchical chord closure consistency constraints
+                if config.chord_consistency_weight > 0.0 {
+                    for s in &active_spans {
+                        if s.level == 0 || s.status == BranchStatus::Pruned {
+                            continue;
+                        }
+                        let target = if coord == 0 {
+                            s.composed_translation.0
+                        } else {
+                            s.composed_translation.1
+                        };
+                        let cur_pred = if coord == 0 {
+                            pos_x[s.end_frame] - pos_x[s.start_frame]
+                        } else {
+                            pos_y[s.end_frame] - pos_y[s.start_frame]
+                        };
+                        let r = (cur_pred - target).abs();
+                        let huber_w = if r <= delta { 1.0 } else { delta / r };
+                        let w = config.chord_consistency_weight * huber_w;
+
+                        let idx_end = if s.end_frame > 0 {
+                            Some(s.end_frame - 1)
+                        } else {
+                            None
+                        };
+                        let idx_start = if s.start_frame > 0 {
+                            Some(s.start_frame - 1)
+                        } else {
+                            None
+                        };
+
+                        if let Some(ie) = idx_end {
+                            g_flat[ie] += w * target;
+                            h_flat[ie * num_vars + ie] += w;
+                        }
+                        if let Some(is) = idx_start {
+                            g_flat[is] -= w * target;
+                            h_flat[is * num_vars + is] += w;
+                        }
+                        if let (Some(ie), Some(is)) = (idx_end, idx_start) {
+                            h_flat[ie * num_vars + is] -= w;
+                            h_flat[is * num_vars + ie] -= w;
+                        }
+                    }
+                }
+
+                if let Some(sol) = solve_linear_system_stack(
+                    num_vars,
+                    &h_flat[..num_vars * num_vars],
+                    &g_flat[..num_vars],
+                ) {
+                    if coord == 0 {
+                        u_x = sol;
+                    } else {
+                        u_y = sol;
+                    }
+                } else {
+                    solver_failed = true;
+                }
+            }
+
+            if solver_failed {
+                break;
+            }
+
+            // Update positions
+            let mut max_change = 0.0_f32;
+            for v in 1..n {
+                let dx = u_x[v - 1] - pos_x[v];
+                let dy = u_y[v - 1] - pos_y[v];
+                max_change = max_change.max(dx.abs().max(dy.abs()));
+                pos_x[v] = u_x[v - 1];
+                pos_y[v] = u_y[v - 1];
+            }
+
+            if max_change < config.convergence_epsilon {
+                break;
+            }
+        }
+
+        // 3. Post-solve verification and safe fallback sanity check
+        let mut fallback_triggered = false;
+        let mut fallback_reason = None;
+
+        if solver_failed {
+            fallback_triggered = true;
+            fallback_reason =
+                Some("Linear solver singularity / ill-conditioned matrix".to_string());
+        } else if pos_x.iter().any(|v| !v.is_finite()) || pos_y.iter().any(|v| !v.is_finite()) {
+            fallback_triggered = true;
+            fallback_reason =
+                Some("Non-finite camera positions detected after optimization".to_string());
+        } else if config.tolerance.enforce_monotonicity && n >= 2 {
+            // Check along-baseline monotonicity
+            let nominal_total = initial_pos_x[n - 1] - initial_pos_x[0];
+            if nominal_total.abs() > 1.0 {
+                let is_positive = nominal_total > 0.0;
+                for v in 0..n - 1 {
+                    let step = pos_x[v + 1] - pos_x[v];
+                    if (is_positive && step <= 0.0) || (!is_positive && step >= 0.0) {
+                        fallback_triggered = true;
+                        fallback_reason = Some(format!(
+                            "Monotonicity violation between Camera {} and {}: step={:.2}px",
+                            v,
+                            v + 1,
+                            step
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Compute preliminary RMSE to verify no severe degradation
+        let mut post_sq_err = 0.0_f32;
+        let mut post_count = 0usize;
+        for s in &active_spans {
+            if s.match_count > 0 && s.status != BranchStatus::Pruned {
+                let opt_dx = pos_x[s.end_frame] - pos_x[s.start_frame];
+                let opt_dy = pos_y[s.end_frame] - pos_y[s.start_frame];
+                let rx = s.observed_translation.0 - opt_dx;
+                let ry = s.observed_translation.1 - opt_dy;
+                let res = rx.hypot(ry);
+                post_sq_err += res * res;
+                post_count += 1;
+            }
+        }
+        let test_rmse_after = if post_count > 0 {
+            (post_sq_err / post_count as f32).sqrt()
+        } else {
+            0.0
+        };
+
+        if !fallback_triggered {
+            if test_rmse_after > config.tolerance.max_acceptable_rmse_px {
+                fallback_triggered = true;
+                fallback_reason = Some(format!(
+                    "Post-optimization RMSE {test_rmse_after:.2}px exceeded threshold {:.2}px",
+                    config.tolerance.max_acceptable_rmse_px
+                ));
+            } else if rmse_before_px > 1.0 && test_rmse_after > 1.5 * rmse_before_px {
+                fallback_triggered = true;
+                fallback_reason = Some(format!(
+                    "Optimization degraded residual error: {rmse_before_px:.2}px -> {test_rmse_after:.2}px"
+                ));
+            }
+        }
+
+        // Revert to initial safe positions if fallback was triggered
+        if fallback_triggered {
+            pos_x = initial_pos_x;
+            pos_y = initial_pos_y;
+            tracing::warn!(
+                reason = ?fallback_reason,
+                "Hierarchical extrinsic optimization triggered defensive fallback to nominal initial baseline"
+            );
+        }
+
+        // 4. Final diagnostics calculation
+        let camera_positions: Vec<(f32, f32)> =
+            pos_x.iter().copied().zip(pos_y.iter().copied()).collect();
+
+        let mut adjacent_translations = Vec::with_capacity(n - 1);
+        for v in 0..n - 1 {
+            adjacent_translations.push((pos_x[v + 1] - pos_x[v], pos_y[v + 1] - pos_y[v]));
+        }
+
+        let chord_dy = pos_y[n - 1] - pos_y[0];
+        let mut center_sags_px = Vec::with_capacity(n.saturating_sub(2));
+        for v in 1..n - 1 {
+            let frac = v as f32 / (n - 1) as f32;
+            let expected_y = pos_y[0] + frac * chord_dy;
+            center_sags_px.push(pos_y[v] - expected_y);
+        }
+
+        let mut final_spans = active_spans;
+        let mut final_sq_err = 0.0_f32;
+        let mut final_count = 0usize;
+        let mut level_sq = vec![0.0_f32; max_level + 1];
+        let mut level_cnt = vec![0usize; max_level + 1];
+
+        for s in &mut final_spans {
+            let opt_dx = pos_x[s.end_frame] - pos_x[s.start_frame];
+            let opt_dy = pos_y[s.end_frame] - pos_y[s.start_frame];
+            s.composed_translation = (opt_dx, opt_dy);
+
+            if s.match_count > 0 {
+                let rx = s.observed_translation.0 - opt_dx;
+                let ry = s.observed_translation.1 - opt_dy;
+                let res = rx.hypot(ry);
+                s.chord_residual_px = res;
+
+                if s.status != BranchStatus::Pruned {
+                    final_sq_err += res * res;
+                    final_count += 1;
+
+                    if s.level <= max_level {
+                        level_sq[s.level] += res * res;
+                        level_cnt[s.level] += 1;
+                    }
+                }
+            }
+        }
+
+        let rmse_after_px = if final_count > 0 {
+            (final_sq_err / final_count as f32).sqrt()
+        } else {
+            0.0
+        };
+
+        let rmse_px = RmseMetric::new(rmse_before_px, rmse_after_px);
+        let fallback = if fallback_triggered {
+            FallbackStatus::Triggered {
+                reason: fallback_reason.unwrap_or_else(|| "Unknown fallback condition".to_string()),
+            }
+        } else {
+            FallbackStatus::None
+        };
+
+        let level_rmse_px: Vec<f32> = level_sq
+            .iter()
+            .zip(level_cnt.iter())
+            .map(|(&sq, &cnt)| {
+                if cnt > 0 {
+                    (sq / cnt as f32).sqrt()
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        tracing::info!(
+            num_cameras = n,
+            rmse_before_px = rmse_px.before,
+            rmse_after_px = rmse_px.after,
+            relative_improvement_pct = rmse_px.improvement_pct,
+            fallback_triggered = fallback.is_triggered(),
+            pruned_branches = pruned_branches_count,
+            "Hierarchical camera array extrinsic optimization completed"
+        );
+
+        HierarchicalOptimizationReport {
+            num_cameras: n,
+            rmse_px,
+            camera_positions,
+            adjacent_translations,
+            center_sags_px,
+            level_rmse_px,
+            dyadic_spans: final_spans,
+            fallback,
+            pruned_branches: pruned_branches_count,
+        }
+    }
+}
+
+/// Estimated 6-DoF chassis extrinsics and multi-view geometric alignment properties across sub-frames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChassisExtrinsics {
+    /// Relative translation from Frame 0 to Frame 1 `(along_baseline_dx, cross_baseline_dy)` in pixels.
+    pub translation_01: (f32, f32),
+    /// Relative translation from Frame 1 to Frame 2 `(along_baseline_dx, cross_baseline_dy)` in pixels.
+    pub translation_12: (f32, f32),
+    /// Relative translation from Frame 0 to Frame 2 `(along_baseline_dx, cross_baseline_dy)` in pixels.
+    pub translation_02: (f32, f32),
+    /// Physical vertical center sag in pixels (deviation of Center lens L1 from the L0-L2 chord).
+    pub center_sag_px: f32,
+    /// Measured empirical baseline ratio `|t_01| / |t_12|`.
+    pub empirical_baseline_ratio: f32,
+    /// Root-mean-square reprojection / disparity consistency error in pixels.
+    pub rmse_consistency_px: f32,
+    /// Number of verified triplet feature tracks used for estimation.
+    pub inlier_count: usize,
+    /// Hierarchical reduction tree optimization report for multi-lens arrays ($N \ge 3$).
+    #[serde(default)]
+    pub hierarchical_report: Option<HierarchicalOptimizationReport>,
+}
+
+impl Default for ChassisExtrinsics {
+    fn default() -> Self {
+        Self {
+            translation_01: (0.0, 0.0),
+            translation_12: (0.0, 0.0),
+            translation_02: (0.0, 0.0),
+            center_sag_px: 0.0,
+            empirical_baseline_ratio: 1.0,
+            rmse_consistency_px: 0.0,
+            inlier_count: 0,
+            hierarchical_report: None,
+        }
+    }
+}
+
+impl ChassisExtrinsics {
+    /// Estimates multi-lens chassis extrinsics and geometric offsets from verified feature triplets.
+    ///
+    /// # Arguments
+    /// * `triplets` - Slice of verified feature triplets.
+    /// * `frames` - Slice of feature frames corresponding to sub-views (0, 1, 2).
+    /// * `orientation` - Scan strip layout orientation.
+    ///
+    /// # Returns
+    /// Estimated `ChassisExtrinsics` geometry summary.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn estimate_from_triplets(
+        triplets: &[FeatureTriplet],
+        frames: &[FeatureFrame],
+        orientation: StripOrientation,
+    ) -> Self {
+        if triplets.is_empty() || frames.len() < 3 {
+            return Self::default();
+        }
+
+        let mut d_base_01 = Vec::with_capacity(triplets.len());
+        let mut d_cross_01 = Vec::with_capacity(triplets.len());
+        let mut d_base_12 = Vec::with_capacity(triplets.len());
+        let mut d_cross_12 = Vec::with_capacity(triplets.len());
+        let mut d_base_02 = Vec::with_capacity(triplets.len());
+        let mut d_cross_02 = Vec::with_capacity(triplets.len());
+        let mut sum_sq_cascade = 0.0_f32;
+
+        let mut m01_matches = Vec::with_capacity(triplets.len());
+        let mut m12_matches = Vec::with_capacity(triplets.len());
+        let mut m02_matches = Vec::with_capacity(triplets.len());
+
+        for t in triplets {
+            let p0 = frames[0].keypoints[t.index_0].point;
+            let p1 = frames[1].keypoints[t.index_1].point;
+            let p2 = frames[2].keypoints[t.index_2].point;
+
+            let (p0_b, p0_c, p1_b, p1_c, p2_b, p2_c) = match orientation {
+                StripOrientation::Horizontal => (p0.x, p0.y, p1.x, p1.y, p2.x, p2.y),
+                StripOrientation::Vertical => (p0.y, p0.x, p1.y, p1.x, p2.y, p2.x),
+            };
+
+            d_base_01.push(p0_b - p1_b);
+            d_cross_01.push(p1_c - p0_c);
+            d_base_12.push(p1_b - p2_b);
+            d_cross_12.push(p2_c - p1_c);
+            d_base_02.push(p0_b - p2_b);
+            d_cross_02.push(p2_c - p0_c);
+            sum_sq_cascade += t.cascade_error * t.cascade_error;
+
+            m01_matches.push(FeatureMatch::new(t.index_0, t.index_1, t.confidence));
+            m12_matches.push(FeatureMatch::new(t.index_1, t.index_2, t.confidence));
+            m02_matches.push(FeatureMatch::new(t.index_0, t.index_2, t.confidence));
+        }
+
+        let med_base_01 = compute_median(&mut d_base_01);
+        let med_cross_01 = compute_median(&mut d_cross_01);
+        let med_base_12 = compute_median(&mut d_base_12);
+        let med_cross_12 = compute_median(&mut d_cross_12);
+        let med_base_02 = compute_median(&mut d_base_02);
+        let med_cross_02 = compute_median(&mut d_cross_02);
+
+        // Center lens sag relative to the chord connecting L0 and L2
+        let center_sag_px = med_cross_01 - 0.5 * med_cross_02;
+        let empirical_baseline_ratio = if med_base_12.abs() > 1e-4 {
+            med_base_01 / med_base_12
+        } else {
+            1.0
+        };
+        let rmse_consistency_px = (sum_sq_cascade / triplets.len() as f32).sqrt();
+
+        // Build hierarchical reduction tree optimization report
+        let match_sets = [
+            PairwiseMatchSet::new((0, 1), m01_matches, MatchDirection::Mutual),
+            PairwiseMatchSet::new((1, 2), m12_matches, MatchDirection::Mutual),
+            PairwiseMatchSet::new((0, 2), m02_matches, MatchDirection::Mutual),
+        ];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames[0..3],
+            &match_sets,
+            orientation,
+        );
+        let report = tree.optimize(&HierarchicalExtrinsicsConfig::default());
+
+        Self {
+            translation_01: (med_base_01, med_cross_01),
+            translation_12: (med_base_12, med_cross_12),
+            translation_02: (med_base_02, med_cross_02),
+            center_sag_px,
+            empirical_baseline_ratio,
+            rmse_consistency_px,
+            inlier_count: triplets.len(),
+            hierarchical_report: Some(report),
+        }
+    }
+
+    /// Estimates multi-lens chassis extrinsics and geometric offsets for general $N \ge 3$ lens arrays
+    /// using hierarchical binary tree reduction.
+    ///
+    /// # Arguments
+    /// * `frames` - Slice of feature frames ($N \ge 3$).
+    /// * `match_sets` - Slice of pairwise match sets between camera views.
+    /// * `orientation` - Scan strip layout orientation.
+    /// * `config` - Optional optimization configuration.
+    ///
+    /// # Returns
+    /// Estimated `ChassisExtrinsics` geometry summary and hierarchical optimization report.
+    #[must_use]
+    pub fn estimate_hierarchical(
+        frames: &[FeatureFrame],
+        match_sets: &[PairwiseMatchSet],
+        orientation: StripOrientation,
+        config: Option<&HierarchicalExtrinsicsConfig>,
+    ) -> Self {
+        let n = frames.len();
+        if n < 3 || match_sets.is_empty() {
+            return Self::default();
+        }
+        let cfg = config.copied().unwrap_or_default();
+        let tree =
+            HierarchicalReductionTree::build_from_match_sets(frames, match_sets, orientation);
+        let report = tree.optimize(&cfg);
+
+        let t01 = report
+            .adjacent_translations
+            .first()
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        let t12 = report
+            .adjacent_translations
+            .get(1)
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        let t02 = if report.camera_positions.len() >= 3 {
+            report.camera_positions[2]
+        } else {
+            (t01.0 + t12.0, t01.1 + t12.1)
+        };
+        let center_sag_px = report.center_sags_px.first().copied().unwrap_or(0.0);
+        let empirical_baseline_ratio = if t12.0.abs() > 1e-4 {
+            t01.0 / t12.0
+        } else {
+            1.0
+        };
+        let total_inliers: usize = match_sets.iter().map(PairwiseMatchSet::len).sum();
+
+        Self {
+            translation_01: t01,
+            translation_12: t12,
+            translation_02: t02,
+            center_sag_px,
+            empirical_baseline_ratio,
+            rmse_consistency_px: report.rmse_px.after,
+            inlier_count: total_inliers,
+            hierarchical_report: Some(report),
+        }
+    }
+
+    /// Computes physical motion distances $(d_{01}, d_{12})$ across adjacent sub-frames.
+    #[must_use]
+    pub fn compute_motion_distances(&self, _alpha: f32) -> (f32, f32) {
+        let d01 = self.translation_01.0.hypot(self.translation_01.1);
+        let d12 = self.translation_12.0.hypot(self.translation_12.1);
+        (d01, d12)
+    }
+
+    /// Computes adaptive frame delays $(\Delta t_{01}, \Delta t_{12})$ in milliseconds for uniform motion.
+    #[must_use]
+    #[allow(clippy::tuple_array_conversions)]
+    pub fn compute_adaptive_frame_delays(
+        &self,
+        total_period_ms: u32,
+        min_delay_ms: u32,
+    ) -> (u32, u32) {
+        let (d01, d12) = self.compute_motion_distances(0.0);
+        let delays = crate::geom::compute_non_uniform_frame_delays(
+            &[d01, d12],
+            total_period_ms,
+            min_delay_ms,
+        );
+        if delays.len() >= 2 {
+            (delays[0], delays[1])
+        } else {
+            let half = total_period_ms / 2;
+            (half, total_period_ms - half)
+        }
+    }
+}
+
+/// Computes the median of a floating-point slice in $\mathcal{O}(N)$ linear time using quickselect partitioning.
+#[inline]
+fn compute_median(values: &mut [f32]) -> f32 {
+    let len = values.len();
+    if len == 0 {
+        return 0.0;
+    }
+    let mid = len / 2;
+    let (_, &mut val_mid, _) = values.select_nth_unstable_by(mid, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if len.is_multiple_of(2) {
+        let val_prev = values[..mid]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        f32::midpoint(val_prev, val_mid)
+    } else {
+        val_mid
     }
 }
 
@@ -904,7 +2117,7 @@ pub trait FeatureMatcher: Send + Sync {
     ///
     /// # Errors
     /// Returns [`AlignmentError`] if frames count is less than 3 or pairwise matching fails.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn extract_consistent_triplets(
         &self,
         frames: &[FeatureFrame],
@@ -963,8 +2176,13 @@ pub trait FeatureMatcher: Send + Sync {
                     let k1 = &frames[1].keypoints[i1];
                     let k2 = &frames[2].keypoints[i2];
 
-                    if let Some((disp_01, disp_12, cascade_err)) =
-                        config.verify_triplet(k0.point, k1.point, k2.point)
+                    if let Some((disp_01, disp_12, cascade_err)) = config
+                        .verify_triplet_with_bounds(
+                            k0.point,
+                            k1.point,
+                            k2.point,
+                            Some(frames[0].image_size),
+                        )
                     {
                         // Geometric mean of 3-way matching confidence
                         let conf = (conf_01 * conf_12 * conf_02).cbrt();
@@ -1032,6 +2250,66 @@ pub trait FeatureMatcher: Send + Sync {
         }
 
         Ok(verified_triplets)
+    }
+
+    /// Computes pairwise match sets for all dyadic tree spans across $N \ge 2$ feature frames.
+    ///
+    /// # Errors
+    /// Returns [`AlignmentError`] if frame slice count is less than 2 or pairwise matching fails.
+    fn match_all_dyadic_pairs(
+        &self,
+        frames: &[FeatureFrame],
+        bidirectional: bool,
+    ) -> AlignmentResult<Vec<PairwiseMatchSet>> {
+        let n = frames.len();
+        if n < 2 {
+            return Err(AlignmentError::InvalidInput(
+                "Expected at least 2 feature frames for dyadic pair matching".to_string(),
+            ));
+        }
+
+        let mut pairs = Vec::new();
+        let mut stride = 1usize;
+        while stride < n {
+            for i in 0..n {
+                let k = i + stride;
+                if k < n && !pairs.contains(&(i, k)) {
+                    pairs.push((i, k));
+                }
+            }
+            stride *= 2;
+        }
+        if n > 2 && !pairs.contains(&(0, n - 1)) {
+            pairs.push((0, n - 1));
+        }
+
+        let mut match_sets = Vec::with_capacity(pairs.len());
+        for (i, k) in pairs {
+            let ms = if bidirectional {
+                self.match_pair_bidirectional(&frames[i], &frames[k])?
+            } else {
+                self.match_pair(&frames[i], &frames[k])?
+            };
+            match_sets.push(ms);
+        }
+
+        Ok(match_sets)
+    }
+
+    /// Extracts hierarchical extrinsics optimization report for $N \ge 3$ frames using dyadic tree reduction.
+    ///
+    /// # Errors
+    /// Returns [`AlignmentError`] if matching fails or frame count is insufficient.
+    fn extract_hierarchical_extrinsics(
+        &self,
+        frames: &[FeatureFrame],
+        orientation: StripOrientation,
+        config: &HierarchicalExtrinsicsConfig,
+    ) -> AlignmentResult<HierarchicalOptimizationReport> {
+        let match_sets = self.match_all_dyadic_pairs(frames, true)?;
+        let tree =
+            HierarchicalReductionTree::build_from_match_sets(frames, &match_sets, orientation);
+        Ok(tree.optimize(config))
     }
 }
 
@@ -1124,7 +2402,13 @@ impl FeatureMatcher for SuperPointDescriptorMatcher {
             };
 
             if best_sim >= self.min_similarity && passes_ratio {
-                matches.push(FeatureMatch::new(i_a, best_idx, best_sim));
+                let dist_ratio = if second_best_sim > 0.0 && (1.0 - second_best_sim).abs() > 1e-6 {
+                    Some((1.0 - best_sim) / (1.0 - second_best_sim))
+                } else {
+                    None
+                };
+                let score = MatchScore::new(best_sim, best_sim, dist_ratio);
+                matches.push(FeatureMatch::with_score(i_a, best_idx, score));
             }
         }
 
@@ -1207,6 +2491,8 @@ pub struct SuperPointConfig {
     pub subpixel_patch_radius: usize,
     /// Maximum iterations for sub-pixel refinement convergence (default: 5).
     pub subpixel_max_iterations: usize,
+    /// Maximum allowed drift in pixels from the initial keypoint coordinate before falling back (default: 2.5).
+    pub max_subpixel_drift_px: f32,
     /// Optional explicit path to `superpoint.onnx` model weights.
     pub model_path: Option<PathBuf>,
     /// Remote URL for downloading the model if missing from cache.
@@ -1246,6 +2532,7 @@ impl Default for SuperPointConfig {
             subpixel_refinement: true,
             subpixel_patch_radius: DEFAULT_SUBPIXEL_PATCH_RADIUS,
             subpixel_max_iterations: DEFAULT_SUBPIXEL_MAX_ITERATIONS,
+            max_subpixel_drift_px: DEFAULT_SUBPIXEL_MAX_DRIFT_PX,
             model_path: None,
             model_url: DEFAULT_SUPERPOINT_MODEL_URL.to_string(),
             expected_sha256: Some(DEFAULT_SUPERPOINT_MODEL_SHA256.to_string()),
@@ -1789,7 +3076,31 @@ pub const DEFAULT_SUBPIXEL_MAX_ITERATIONS: usize = 5;
 /// Default convergence displacement epsilon in pixels for sub-pixel keypoint refinement (0.01 px).
 pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
 
+/// Default maximum allowed sub-pixel drift in pixels from initial position before fallback (2.5 px).
+pub const DEFAULT_SUBPIXEL_MAX_DRIFT_PX: f32 = 2.5;
+
 /// Refines keypoint coordinates to sub-pixel accuracy using localized gradient-based photometric patch tracking (Förstner / Lucas-Kanade corner operator).
+///
+/// Delegates to [`refine_keypoints_subpixel_with_drift`] with [`DEFAULT_SUBPIXEL_MAX_DRIFT_PX`].
+#[inline]
+pub fn refine_keypoints_subpixel(
+    image: &image::GrayImage,
+    keypoints: &mut [KeyPoint],
+    radius: usize,
+    max_iterations: usize,
+    epsilon: f32,
+) {
+    refine_keypoints_subpixel_with_drift(
+        image,
+        keypoints,
+        radius,
+        max_iterations,
+        epsilon,
+        DEFAULT_SUBPIXEL_MAX_DRIFT_PX,
+    );
+}
+
+/// Refines keypoint coordinates to sub-pixel accuracy with a configurable maximum drift tolerance.
 ///
 /// For each keypoint detected on coarse or downscaled grids, this samples a full-resolution patch
 /// ($W \times W$ where $W = 2 \times \text{radius} + 1$) around the keypoint, evaluates spatial image gradients
@@ -1802,10 +3113,11 @@ pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
 /// * `radius` - Patch half-window radius in pixels (e.g. 7 for a 15x15 window).
 /// * `max_iterations` - Maximum refinement iterations (e.g. 5).
 /// * `epsilon` - Convergence displacement threshold in pixels (e.g. 0.01).
+/// * `max_drift_px` - Maximum allowed drift in pixels from the initial coordinate (e.g. 2.5).
 ///
 /// # Examples
 /// ```
-/// use reto_core::{refine_keypoints_subpixel, KeyPoint, Point2D};
+/// use reto_core::{refine_keypoints_subpixel_with_drift, KeyPoint, Point2D};
 /// use image::GrayImage;
 ///
 /// let mut img = GrayImage::new(32, 32);
@@ -1816,7 +3128,7 @@ pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
 /// }
 ///
 /// let mut kps = vec![KeyPoint::new(Point2D::new(15.2, 15.3), 0.95, None)];
-/// refine_keypoints_subpixel(&img, &mut kps, 5, 5, 0.01);
+/// refine_keypoints_subpixel_with_drift(&img, &mut kps, 5, 5, 0.01, 2.0);
 /// assert!(kps[0].point.x >= 14.0 && kps[0].point.x <= 16.5);
 /// ```
 #[allow(
@@ -1827,14 +3139,17 @@ pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
     clippy::many_single_char_names,
     clippy::suboptimal_flops,
     clippy::similar_names,
-    clippy::suspicious_operation_groupings
+    clippy::suspicious_operation_groupings,
+    clippy::too_many_lines,
+    clippy::manual_midpoint
 )]
-pub fn refine_keypoints_subpixel(
+pub fn refine_keypoints_subpixel_with_drift(
     image: &image::GrayImage,
     keypoints: &mut [KeyPoint],
     radius: usize,
     max_iterations: usize,
     epsilon: f32,
+    max_drift_px: f32,
 ) {
     let (width, height) = image.dimensions();
     let r = radius as isize;
@@ -1851,7 +3166,7 @@ pub fn refine_keypoints_subpixel(
     let inv_two_sigma_sq = 1.0 / two_sigma_sq;
     let eps_sq = epsilon * epsilon;
     let max_step_sq = 1.5_f32 * 1.5_f32;
-    let max_drift_sq = 2.5_f32 * 2.5_f32;
+    let max_drift_sq = max_drift_px * max_drift_px;
 
     let min_bound = (radius + 1) as f32;
     let max_bound_x = (width.saturating_sub(radius as u32 + 2)) as f32;
@@ -1865,13 +3180,17 @@ pub fn refine_keypoints_subpixel(
         // Check if initial keypoint is within safe margins
         if x_init < min_bound || x_init > max_bound_x || y_init < min_bound || y_init > max_bound_y
         {
+            kp.subpixel_status = SubpixelStatus::BoundarySkipped;
             return;
         }
 
         let mut x_curr = x_init;
         let mut y_curr = y_init;
+        let mut iters_done = 0;
+        let mut status = SubpixelStatus::NeuralOnly;
 
-        for _ in 0..max_iterations {
+        for iter in 0..max_iterations {
+            iters_done = iter + 1;
             let mut a = 0.0_f32; // sum w * Ix^2
             let mut b = 0.0_f32; // sum w * Ix * Iy
             let mut c = 0.0_f32; // sum w * Iy^2
@@ -1886,7 +3205,17 @@ pub fn refine_keypoints_subpixel(
                 || cy_round - r - 1 < 0
                 || cy_round + r + 1 >= height as isize
             {
+                status = SubpixelStatus::BoundarySkipped;
                 break;
+            }
+
+            // Precompute 1D separable horizontal Gaussian kernel weights and delta_x on stack
+            let mut weight_x_arr = [0.0_f32; 33];
+            let mut delta_x_arr = [0.0_f32; 33];
+            for (idx, dx) in (-r..=r).enumerate() {
+                let delta_x = ((cx_round + dx) as f32) - x_curr;
+                delta_x_arr[idx] = delta_x;
+                weight_x_arr[idx] = (-delta_x * delta_x * inv_two_sigma_sq).exp();
             }
 
             for dy in -r..=r {
@@ -1898,11 +3227,10 @@ pub fn refine_keypoints_subpixel(
                 let prev_row = &raw[(py - 1) * w..py * w];
                 let next_row = &raw[(py + 1) * w..(py + 2) * w];
 
-                for dx in -r..=r {
+                for (idx_x, dx) in (-r..=r).enumerate() {
                     let px = (cx_round + dx) as usize;
-                    let delta_x = ((cx_round + dx) as f32) - x_curr;
-                    let weight_x = (-delta_x * delta_x * inv_two_sigma_sq).exp();
-                    let weight = weight_y * weight_x;
+                    let delta_x = delta_x_arr[idx_x];
+                    let weight = weight_y * weight_x_arr[idx_x];
 
                     // Branchless contiguous central gradient evaluation
                     let ix =
@@ -1928,12 +3256,32 @@ pub fn refine_keypoints_subpixel(
 
             // Structure tensor conditioning check (ensure non-degenerate 2D corner)
             if det < 1e-7 || tr < 1e-5 {
+                status = SubpixelStatus::PoorConditioning {
+                    min_eigenvalue: 0.0,
+                    cond_ratio: 0.0,
+                };
                 break;
             }
 
             let trace_sq_minus_4det = (tr * tr - 4.0 * det).max(0.0);
-            let lambda_min = 0.5 * (tr - trace_sq_minus_4det.sqrt());
+            let sqrt_term = trace_sq_minus_4det.sqrt();
+            // Note (Eigenvalues vs Midpoint): Explicit `0.5 * (tr +- sqrt_term)` reflects the analytical
+            // quadratic 2x2 eigenvalue formula `(tr +- sqrt(tr^2 - 4*det)) / 2`. `f32::midpoint(tr, sqrt_term)`
+            // avoids intermediate overflow on huge floats, but normalized gradient traces here are strictly
+            // bounded (0.0..~10.0), making overflow impossible while preserving notation symmetry with `lambda_min`.
+            let lambda_min = 0.5 * (tr - sqrt_term);
+            let lambda_max = 0.5 * (tr + sqrt_term);
+            let cond_ratio = if lambda_max > 1e-6 {
+                lambda_min / lambda_max
+            } else {
+                0.0
+            };
+
             if lambda_min < 1e-5 {
+                status = SubpixelStatus::PoorConditioning {
+                    min_eigenvalue: lambda_min,
+                    cond_ratio,
+                };
                 break;
             }
 
@@ -1954,17 +3302,35 @@ pub fn refine_keypoints_subpixel(
                 (x_curr - x_init) * (x_curr - x_init) + (y_curr - y_init) * (y_curr - y_init);
             if drift_sq > max_drift_sq {
                 // Revert to initial if displacement wandered too far
+                let drift_px = drift_sq.sqrt();
                 x_curr = x_init;
                 y_curr = y_init;
+                status = SubpixelStatus::DriftRejected { drift_px };
                 break;
             }
 
             if step_norm_sq < eps_sq {
+                status = SubpixelStatus::Refined {
+                    delta: (x_curr - x_init, y_curr - y_init),
+                    iterations: iters_done,
+                };
                 break;
             }
         }
 
+        if status == SubpixelStatus::NeuralOnly {
+            let dx = x_curr - x_init;
+            let dy = y_curr - y_init;
+            if dx * dx + dy * dy > 1e-6 {
+                status = SubpixelStatus::Refined {
+                    delta: (dx, dy),
+                    iterations: iters_done,
+                };
+            }
+        }
+
         kp.point = Point2D::new(x_curr, y_curr);
+        kp.subpixel_status = status;
     });
 }
 
@@ -2082,12 +3448,13 @@ impl PointDetector for SuperPointDetector {
             match plan_res {
                 Ok(mut kps) => {
                     if self.config.subpixel_refinement {
-                        refine_keypoints_subpixel(
+                        refine_keypoints_subpixel_with_drift(
                             &gray_orig,
                             &mut kps,
                             self.config.subpixel_patch_radius,
                             self.config.subpixel_max_iterations,
                             DEFAULT_SUBPIXEL_EPSILON_PX,
+                            self.config.max_subpixel_drift_px,
                         );
                     }
                     return Ok(kps);
@@ -2130,12 +3497,13 @@ impl PointDetector for SuperPointDetector {
             .collect();
 
         if self.config.subpixel_refinement {
-            refine_keypoints_subpixel(
+            refine_keypoints_subpixel_with_drift(
                 &gray_orig,
                 &mut keypoints,
                 self.config.subpixel_patch_radius,
                 self.config.subpixel_max_iterations,
                 DEFAULT_SUBPIXEL_EPSILON_PX,
+                self.config.max_subpixel_drift_px,
             );
         }
 
@@ -2382,12 +3750,13 @@ impl PointDetector for SuperPointDetector {
             };
 
             if self.config.subpixel_refinement {
-                refine_keypoints_subpixel(
+                refine_keypoints_subpixel_with_drift(
                     &spec.orig_img,
                     &mut keypoints,
                     self.config.subpixel_patch_radius,
                     self.config.subpixel_max_iterations,
                     DEFAULT_SUBPIXEL_EPSILON_PX,
+                    self.config.max_subpixel_drift_px,
                 );
             }
 
@@ -2601,6 +3970,91 @@ mod tests {
         // 3. Outlier due to opposing disparity directions (forward vs reverse):
         let p1_opposing_disp = Point2D::new(120.0, 50.0);
         assert!(config.verify_triplet(p0, p1_opposing_disp, p2).is_none());
+
+        // 4. Optical distortion disparity variation (disp_01 = 20, disp_12 = 5 -> disp_02 = 25) is preserved:
+        let p2_distortion = Point2D::new(75.0, 50.0);
+        let res_distortion = config.verify_triplet(p0, p1, p2_distortion);
+        assert!(res_distortion.is_some());
+        let (d01, d12, err) = res_distortion.unwrap();
+        assert_eq!(d01, 20.0);
+        assert_eq!(d12, 5.0);
+        assert_eq!(err, 0.0);
+
+        // 5. Outlier due to cross-baseline jitter between Frame 0 and Frame 2 exceeding tolerance:
+        let p2_jitter = Point2D::new(60.0, 80.0);
+        assert!(config.verify_triplet(p0, p1, p2_jitter).is_none());
+    }
+
+    #[test]
+    fn test_chassis_extrinsics_estimation() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.33, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None),
+                KeyPoint::new(Point2D::new(200.0, 80.0), 0.9, None),
+            ],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(80.0, 52.0), 0.9, None),
+                KeyPoint::new(Point2D::new(180.0, 82.0), 0.9, None),
+            ],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None),
+                KeyPoint::new(Point2D::new(160.0, 80.0), 0.9, None),
+            ],
+        );
+
+        let triplets = vec![
+            FeatureTriplet {
+                index_0: 0,
+                index_1: 0,
+                index_2: 0,
+                confidence: 0.9,
+                disparity_01: 20.0,
+                disparity_12: 20.0,
+                cascade_error: 0.0,
+            },
+            FeatureTriplet {
+                index_0: 1,
+                index_1: 1,
+                index_2: 1,
+                confidence: 0.9,
+                disparity_01: 20.0,
+                disparity_12: 20.0,
+                cascade_error: 0.0,
+            },
+        ];
+
+        let frames = [f0, f1, f2];
+        let extrinsics = ChassisExtrinsics::estimate_from_triplets(
+            &triplets,
+            &frames,
+            StripOrientation::Horizontal,
+        );
+
+        assert_eq!(extrinsics.inlier_count, 2);
+        assert_eq!(extrinsics.translation_01.0, 20.0);
+        assert_eq!(extrinsics.translation_01.1, 2.0); // center frame dropped by 2px relative to frame 0
+        assert_eq!(extrinsics.translation_12.0, 20.0);
+        assert_eq!(extrinsics.translation_12.1, -2.0); // frame 2 moved up by 2px relative to frame 1
+        assert_eq!(extrinsics.translation_02.0, 40.0);
+        assert_eq!(extrinsics.translation_02.1, 0.0); // frame 0 and frame 2 collinear on Y
+        assert_eq!(extrinsics.center_sag_px, 2.0); // center sag is 2.0px
+        assert!((extrinsics.empirical_baseline_ratio - 1.0).abs() < 1e-4);
     }
 
     struct MockFeatureMatcher {
@@ -2739,6 +4193,10 @@ mod tests {
             "Refined Y {} is not within 0.05 of true corner 31.5",
             kps[0].point.y
         );
+        assert!(matches!(
+            kps[0].subpixel_status,
+            SubpixelStatus::Refined { .. }
+        ));
     }
 
     #[test]
@@ -2754,13 +4212,51 @@ mod tests {
 
         refine_keypoints_subpixel(&flat_img, &mut kps, 7, 5, 0.01);
 
-        // Flat region and border points should remain stable without drifting or NaN
+        // Flat region should report PoorConditioning and border points should report BoundarySkipped
         assert!((kps[0].point.x - 32.0).abs() < f32::EPSILON);
         assert!((kps[0].point.y - 32.0).abs() < f32::EPSILON);
+        assert!(matches!(
+            kps[0].subpixel_status,
+            SubpixelStatus::PoorConditioning { .. }
+        ));
+
         assert!((kps[1].point.x - 1.0).abs() < f32::EPSILON);
         assert!((kps[1].point.y - 1.0).abs() < f32::EPSILON);
+        assert_eq!(kps[1].subpixel_status, SubpixelStatus::BoundarySkipped);
+
         assert!((kps[2].point.x - 63.0).abs() < f32::EPSILON);
         assert!((kps[2].point.y - 63.0).abs() < f32::EPSILON);
+        assert_eq!(kps[2].subpixel_status, SubpixelStatus::BoundarySkipped);
+    }
+
+    #[test]
+    fn test_subpixel_refinement_drift_rejection() {
+        use image::GrayImage;
+
+        let mut img = GrayImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                if (x < 32 && y < 32) || (x >= 32 && y >= 32) {
+                    img.put_pixel(x, y, image::Luma([240]));
+                } else {
+                    img.put_pixel(x, y, image::Luma([15]));
+                }
+            }
+        }
+
+        // Perturbed initial point placed at (32.3, 32.2) which is ~1.06px away from corner (31.5, 31.5)
+        let mut kps = vec![KeyPoint::new(Point2D::new(32.3, 32.2), 0.99, None)];
+
+        // Run with strict max drift = 0.4px (smaller than required 1.06px displacement)
+        refine_keypoints_subpixel_with_drift(&img, &mut kps, 7, 5, 0.005, 0.4);
+
+        // Should be rejected due to drift exceeding 0.4px and reverted to initial (32.3, 32.2)
+        assert!((kps[0].point.x - 32.3).abs() < f32::EPSILON);
+        assert!((kps[0].point.y - 32.2).abs() < f32::EPSILON);
+        assert!(matches!(
+            kps[0].subpixel_status,
+            SubpixelStatus::DriftRejected { .. }
+        ));
     }
 
     #[test]
@@ -2797,5 +4293,294 @@ mod tests {
 
         assert!(!kps_off.is_empty());
         assert!(!kps_on.is_empty());
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_tree_n3() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.33, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None),
+                KeyPoint::new(Point2D::new(200.0, 80.0), 0.9, None),
+            ],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(80.0, 52.0), 0.9, None),
+                KeyPoint::new(Point2D::new(180.0, 82.0), 0.9, None),
+            ],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None),
+                KeyPoint::new(Point2D::new(160.0, 80.0), 0.9, None),
+            ],
+        );
+
+        let frames = [f0, f1, f2];
+        let m01 = PairwiseMatchSet::new(
+            (0, 1),
+            vec![FeatureMatch::new(0, 0, 0.9), FeatureMatch::new(1, 1, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m12 = PairwiseMatchSet::new(
+            (1, 2),
+            vec![FeatureMatch::new(0, 0, 0.9), FeatureMatch::new(1, 1, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m02 = PairwiseMatchSet::new(
+            (0, 2),
+            vec![FeatureMatch::new(0, 0, 0.9), FeatureMatch::new(1, 1, 0.9)],
+            MatchDirection::Mutual,
+        );
+
+        let match_sets = [m01, m12, m02];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames,
+            &match_sets,
+            StripOrientation::Horizontal,
+        );
+
+        assert_eq!(tree.num_frames, 3);
+        assert!(!tree.spans.is_empty());
+
+        let report = tree.optimize(&HierarchicalExtrinsicsConfig::default());
+        assert_eq!(report.num_cameras, 3);
+        assert_eq!(report.camera_positions.len(), 3);
+        assert_eq!(report.camera_positions[0], (0.0, 0.0));
+        assert!((report.camera_positions[1].0 - 20.0).abs() < 1e-3);
+        assert!((report.camera_positions[1].1 - 2.0).abs() < 1e-3);
+        assert!((report.camera_positions[2].0 - 40.0).abs() < 1e-3);
+        assert!((report.camera_positions[2].1 - 0.0).abs() < 1e-3);
+        assert_eq!(report.center_sags_px.len(), 1);
+        assert!((report.center_sags_px[0] - 2.0).abs() < 1e-3);
+        assert!(report.rmse_px.after < 0.01);
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_tree_n4() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.25, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None)],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(80.0, 51.0), 0.9, None)],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(60.0, 52.0), 0.9, None)],
+        );
+        let f3 = FeatureFrame::new(
+            3,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(40.0, 50.0), 0.9, None)],
+        );
+
+        let frames = [f0, f1, f2, f3];
+        let m01 = PairwiseMatchSet::new(
+            (0, 1),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m12 = PairwiseMatchSet::new(
+            (1, 2),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m23 = PairwiseMatchSet::new(
+            (2, 3),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m02 = PairwiseMatchSet::new(
+            (0, 2),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m13 = PairwiseMatchSet::new(
+            (1, 3),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m03 = PairwiseMatchSet::new(
+            (0, 3),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+
+        let match_sets = [m01, m12, m23, m02, m13, m03];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames,
+            &match_sets,
+            StripOrientation::Horizontal,
+        );
+
+        assert_eq!(tree.num_frames, 4);
+        let report = tree.optimize(&HierarchicalExtrinsicsConfig::default());
+        assert_eq!(report.num_cameras, 4);
+        assert_eq!(report.adjacent_translations.len(), 3);
+        assert_eq!(report.center_sags_px.len(), 2);
+        assert!(report.rmse_px.after < 0.05);
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_branch_pruning() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.25, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None)],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(80.0, 50.0), 0.9, None)],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None), // Inlier for m12 (disp = 20)
+                KeyPoint::new(Point2D::new(10.0, 50.0), 0.9, None), // False outlier for m02 (disp = 90)
+            ],
+        );
+        let f3 = FeatureFrame::new(
+            3,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(40.0, 50.0), 0.9, None)],
+        );
+
+        let frames = [f0, f1, f2, f3];
+        let m01 = PairwiseMatchSet::new(
+            (0, 1),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m12 = PairwiseMatchSet::new(
+            (1, 2),
+            vec![FeatureMatch::new(0, 0, 0.9)], // matches index 0 -> disp 20.0
+            MatchDirection::Mutual,
+        );
+        let m23 = PairwiseMatchSet::new(
+            (2, 3),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m02_corrupt = PairwiseMatchSet::new(
+            (0, 2),
+            vec![FeatureMatch::new(0, 1, 0.9)], // matches index 1 -> disp 90.0 (residual 50.0px)
+            MatchDirection::Mutual,
+        );
+
+        let match_sets = [m01, m12, m23, m02_corrupt];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames,
+            &match_sets,
+            StripOrientation::Horizontal,
+        );
+
+        let config = HierarchicalExtrinsicsConfig {
+            tolerance: ExtrinsicsTolerance {
+                max_branch_residual_px: 15.0,
+                ..ExtrinsicsTolerance::default()
+            },
+            ..HierarchicalExtrinsicsConfig::default()
+        };
+        let report = tree.optimize(&config);
+
+        // Branch (0, 2) should be quarantined & pruned
+        assert!(report.pruned_branches >= 1);
+        assert!(!report.fallback.is_triggered());
+        // Positions should remain clean ~20px step between frames
+        assert!((report.camera_positions[1].0 - 20.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_catastrophic_fallback() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.33, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None)],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(80.0, 50.0), 0.9, None)],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None)],
+        );
+
+        let frames = [f0, f1, f2];
+        let m01 = PairwiseMatchSet::new(
+            (0, 1),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m12 = PairwiseMatchSet::new(
+            (1, 2),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+
+        let match_sets = [m01, m12];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames,
+            &match_sets,
+            StripOrientation::Horizontal,
+        );
+
+        // Test with max_acceptable_rmse_px = 0.000_001 (impossible tolerance to trigger defensive fallback)
+        let config = HierarchicalExtrinsicsConfig {
+            tolerance: ExtrinsicsTolerance {
+                max_acceptable_rmse_px: 0.000_001,
+                ..ExtrinsicsTolerance::default()
+            },
+            ..HierarchicalExtrinsicsConfig::default()
+        };
+        let report = tree.optimize(&config);
+
+        assert!(report.fallback.is_triggered());
+        assert!(report.fallback.reason().is_some());
+        // Clean baseline retained
+        assert_eq!(report.camera_positions[0], (0.0, 0.0));
+        assert_eq!(report.camera_positions[1], (20.0, 0.0));
+        assert_eq!(report.camera_positions[2], (40.0, 0.0));
     }
 }

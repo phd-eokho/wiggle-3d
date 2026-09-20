@@ -93,11 +93,7 @@ impl ImageItemContext {
             luma_image: None,
             features: None,
             device: crate::feature::BackendDevice::Auto,
-            gif_config: crate::gif::WiggleGifConfig {
-                delay_ms: crate::gif::DEFAULT_FRAME_DELAY_MS,
-                sample_factor: crate::gif::DEFAULT_NEUQUANT_SAMPLE_FAC,
-                dither: true,
-            },
+            gif_config: crate::gif::WiggleGifConfig::new(crate::gif::DEFAULT_FRAME_DELAY_MS),
             debug: false,
         }
     }
@@ -311,11 +307,7 @@ impl BatchProcessingRequest {
             output_dir,
             debug,
             device: crate::feature::BackendDevice::Auto,
-            gif_config: crate::gif::WiggleGifConfig {
-                delay_ms: crate::gif::DEFAULT_FRAME_DELAY_MS,
-                sample_factor: crate::gif::DEFAULT_NEUQUANT_SAMPLE_FAC,
-                dither: true,
-            },
+            gif_config: crate::gif::WiggleGifConfig::new(crate::gif::DEFAULT_FRAME_DELAY_MS),
             progress_observer: None,
         }
     }
