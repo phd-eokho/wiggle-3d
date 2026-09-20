@@ -40,7 +40,7 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 - **Intelligent Facial Detection & Focal Locking**: Automatically identifies human subjects and facial landmarks from the user's perspective, locking the stereoscopic focal plane onto faces so the main subject remains sharp, stable, and perfectly anchored.
 - **Automated Frame Splitting**: Automatically detects sub-frame boundaries on raw film strips, eliminating tedious manual cropping.
 - **Flicker-Free Unified Palette Quantization**: Computes a global 256-color palette across all frames with Floyd-Steinberg dithering to prevent color flashing between loop frames.
-- **Native 24-bit TrueColor HEVC MP4 Video Export**: Generates high-efficiency 24-bit TrueColor H.265 (HEVC) MP4 videos with variable $\mathrm{SE}(3)$ timing preservation alongside standard animated GIFs.
+- **Native 24-bit TrueColor HEVC MP4 Video Export**: Generates high-efficiency 24-bit TrueColor H.265 (HEVC) MP4 videos with variable $\mathrm{SE}(3)$ timing preservation instead of standard animated GIFs (skipping 256-color palette quantization for maximum speed and fidelity).
 - **Diagnostic Visual Overlays**: Generates visual debug artifacts including RoI boundary boxes, facial landmark points, and epipolar match vectors when run with `--debug`.
 
 ---
@@ -132,7 +132,7 @@ reto-cli [OPTIONS] --input <PATH> --output <DIR>
 | `--debug` | `bool` (Flag) | Enables intermediate debug outputs (RoI overlays, matched features, disparity logs). |
 | `--gif-delay <MS>` | `u32` (Default: `100`) | Inter-frame animation delay in milliseconds (100ms = 10 fps). |
 | `--no-dither` | `bool` (Flag) | Disables Floyd-Steinberg dithering during NeuQuant color quantization. |
-| `--enable-mp4` | `bool` (Flag) | Enables native 24-bit TrueColor HEVC (H.265) MP4 video export alongside GIF. |
+| `--enable-mp4` | `bool` (Flag) | Enables native 24-bit TrueColor HEVC (H.265) MP4 video export instead of GIF. |
 | `--enable-nvenc` | `bool` (Flag) | Forces NVIDIA NVENC hardware acceleration for HEVC MP4 video generation. |
 | `--mp4-loops <COUNT>` | `usize` (Default: `4`) | Number of continuous ping-pong wiggle loop cycles encoded into the MP4 video. |
 | `--mp4-crf <CRF>` | `u32` (Default: `18`) | Constant Rate Factor for HEVC video encoding (0–51, lower means higher quality). |

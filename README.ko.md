@@ -40,7 +40,7 @@
 - **인물 얼굴 감지 및 초점 고정 (Face Focal Locking)**: 시선이 집중되는 인물과 얼굴 랜드마크를 자동 감지하고, 해당 위치에 초점 평면(Focal Plane)을 고정하여 피사체가 흔들림 없이 또렷하게 유지되도록 합니다.
 - **자동 서브프레임 분할 (Automated Frame Splitting)**: 원본 필름 스트립에서 각 렌즈 프레임의 경계를 자동으로 감지하고 분할(Crop)합니다.
 - **깜빡임 없는 통합 팔레트 양자화 (Flicker-Free Unified Palette)**: 모든 프레임에 걸쳐 전역 256색 팔레트와 Floyd-Steinberg dithering을 적용하여 프레임 전환 시 발생하는 색상 깜빡임을 제거합니다.
-- **네이티브 24-bit TrueColor HEVC MP4 비디오 출력**: 표준 GIF 애니메이션과 함께 $\mathrm{SE}(3)$ 시차 타이밍이 보존된 고품질 24-bit TrueColor H.265 (HEVC) MP4 비디오를 하드웨어 가속으로 생성합니다.
+- **네이티브 24-bit TrueColor HEVC MP4 비디오 출력**: 표준 GIF 대신 $\mathrm{SE}(3)$ 시차 타이밍이 보존된 고품질 24-bit TrueColor H.265 (HEVC) MP4 비디오를 하드웨어 가속으로 생성합니다 (256색 팔레트 양자화 단계를 생략하여 처리 속도와 품질을 극대화).
 - **진단용 시각화 오버레이 (Diagnostic Visual Overlays)**: `--debug` 옵션 실행 시 RoI 경계 박스, 얼굴 랜드마크, 특징점 매칭 벡터가 시각화된 디버그 이미지를 생성합니다.
 
 ---
@@ -98,7 +98,7 @@ cargo build --release
 reto-cli --input samples/film_strip_01.jpg --output output_dir/
 ```
 
-#### 24-bit TrueColor HEVC MP4 비디오 함께 생성
+#### 24-bit TrueColor HEVC MP4 비디오 생성 (GIF 대신 MP4 출력)
 ```bash
 reto-cli --input samples/ --output results/ --enable-mp4
 ```
@@ -132,7 +132,7 @@ reto-cli [OPTIONS] --input <PATH> --output <DIR>
 | `--debug` | `bool` (플래그) | 중간 디버그 시각화 출력 활성화 (RoI 오버레이, 특징점 매칭 벡터, 시차 로그 등). |
 | `--gif-delay <MS>` | `u32` (기본값: `100`) | 프레임 간 애니메이션 지연 시간 (밀리초 단위, 100ms = 10 fps). |
 | `--no-dither` | `bool` (플래그) | NeuQuant 색상 양자화 시 Floyd-Steinberg 디더링 비활성화. |
-| `--enable-mp4` | `bool` (플래그) | GIF와 함께 24-bit TrueColor HEVC (H.265) MP4 비디오 생성 활성화. |
+| `--enable-mp4` | `bool` (플래그) | GIF 대신 24-bit TrueColor HEVC (H.265) MP4 비디오 생성 활성화. |
 | `--enable-nvenc` | `bool` (플래그) | HEVC MP4 비디오 생성 시 NVIDIA NVENC 하드웨어 가속 강제 사용. |
 | `--mp4-loops <COUNT>` | `usize` (기본값: `4`) | MP4 비디오 내 인코딩될 핑퐁 루프 반복 횟수. |
 | `--mp4-crf <CRF>` | `u32` (기본값: `18`) | HEVC 비디오 인코딩 품질/압축률 (0–51, 낮을수록 고화질). |

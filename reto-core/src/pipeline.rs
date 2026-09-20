@@ -788,23 +788,8 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
     })
 }
 
-/// Stage 3: In-memory NeuQuant color quantization, GIF byte serialization, and optional MP4 video encoding.
+/// Stage 3: In-memory NeuQuant color quantization and GIF byte serialization, or MP4 video encoding.
 fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<EncodedStagePayload> {
-    let gif_output = if let Some(ref aligned_frames) = payload.aligned_frames {
-        let gif_path = payload
-            .output_dir
-            .join(format!("{}_wiggle.gif", payload.file_stem));
-        let mut gif_bytes = Vec::new();
-        crate::gif::WiggleGifBuilder::build_wiggle_gif(
-            aligned_frames,
-            &payload.item.gif_config(),
-            &mut gif_bytes,
-        )?;
-        Some((gif_path, gif_bytes))
-    } else {
-        None
-    };
-
     let video_output = if let (Some(ref aligned_frames), Some(video_cfg)) =
         (&payload.aligned_frames, payload.item.video_config())
     {
@@ -818,6 +803,25 @@ fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<Encoded
             &mut video_bytes,
         )?;
         Some((video_path, video_bytes))
+    } else {
+        None
+    };
+
+    let gif_output = if video_output.is_none() {
+        if let Some(ref aligned_frames) = payload.aligned_frames {
+            let gif_path = payload
+                .output_dir
+                .join(format!("{}_wiggle.gif", payload.file_stem));
+            let mut gif_bytes = Vec::new();
+            crate::gif::WiggleGifBuilder::build_wiggle_gif(
+                aligned_frames,
+                &payload.item.gif_config(),
+                &mut gif_bytes,
+            )?;
+            Some((gif_path, gif_bytes))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -1144,10 +1148,20 @@ mod tests {
 
         // Debug run: verify roi_overlay is saved when debug is enabled
         let request_debug =
-            BatchProcessingRequest::new(vec![input_path], output_path.clone(), true);
+            BatchProcessingRequest::new(vec![input_path.clone()], output_path.clone(), true);
         let summary_debug = run_batch(&request_debug).expect("Debug batch should run");
         assert_eq!(summary_debug.successful_count, 1);
         assert!(output_path.join("sample_strip_roi_overlay.png").exists());
+
+        // Video run: verify wiggle MP4 is saved and GIF is NOT saved when video config is enabled
+        let video_output_path = temp_dir.join("video_output");
+        let video_config = crate::video::WiggleVideoConfig::new().with_mock_fallback(true);
+        let request_video = BatchProcessingRequest::new(vec![input_path], video_output_path.clone(), false)
+            .with_video_config(Some(video_config));
+        let summary_video = run_batch(&request_video).expect("Video batch should run");
+        assert_eq!(summary_video.successful_count, 1);
+        assert!(video_output_path.join("sample_strip_wiggle.mp4").exists());
+        assert!(!video_output_path.join("sample_strip_wiggle.gif").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -50,7 +50,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_dither: bool,
 
-    /// Enable 24-bit `TrueColor` HEVC MP4 video generation alongside GIF
+    /// Enable 24-bit `TrueColor` HEVC MP4 video generation instead of GIF
     #[arg(long)]
     pub enable_mp4: bool,
 
