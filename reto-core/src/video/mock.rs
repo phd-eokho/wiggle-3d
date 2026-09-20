@@ -3,9 +3,9 @@
 //! Generates valid HEVC parameter sets (VPS, SPS, PPS) and compliant sample NAL units
 //! allowing end-to-end container multiplexing and playback testing without GPU hardware.
 
-use crate::color::Yuv420PlanarFrame;
 use super::mp4_muxer::{HevcNalUnit, NAL_IDR_W_RADL, NAL_PPS, NAL_SPS, NAL_TRAIL_R, NAL_VPS};
 use super::{HevcEncoderConfig, HevcFrameEncoder, VideoError};
+use crate::color::Yuv420PlanarFrame;
 
 /// Software fallback HEVC video frame encoder.
 pub struct SoftwareMockHevcEncoder {

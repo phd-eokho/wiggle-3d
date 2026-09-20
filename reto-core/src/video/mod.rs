@@ -3,20 +3,20 @@
 //! Provides hardware-accelerated video export (NVENC, VA-API, VideoToolbox, Media Foundation)
 //! and 24-bit TrueColor MP4 generation with variable $\mathrm{SE}(3)$ timing preservation.
 
+pub mod mediafoundation;
 pub mod mock;
 pub mod mp4_muxer;
 pub mod nvenc;
 pub mod vaapi;
 pub mod videotoolbox;
-pub mod mediafoundation;
 
-pub use crate::color::{BT709_YUV_MATRIX, RgbaToYuv420Converter, Yuv420PlanarFrame};
+pub use crate::color::{RgbaToYuv420Converter, Yuv420PlanarFrame, BT709_YUV_MATRIX};
+pub use mediafoundation::MediaFoundationHevcEncoder;
+pub use mock::SoftwareMockHevcEncoder;
 pub use mp4_muxer::{EncodedVideoSample, HevcNalUnit, Mp4Muxer};
 pub use nvenc::NvencHevcEncoder;
 pub use vaapi::VaapiHevcEncoder;
 pub use videotoolbox::VideoToolboxHevcEncoder;
-pub use mediafoundation::MediaFoundationHevcEncoder;
-pub use mock::SoftwareMockHevcEncoder;
 
 use crate::error::{Error, Result};
 use image::RgbaImage;
@@ -88,7 +88,11 @@ pub trait HevcFrameEncoder: Send {
     ///
     /// # Errors
     /// Returns [`VideoError`] if picture encoding fails.
-    fn encode_frame(&mut self, frame: &Yuv420PlanarFrame, is_keyframe: bool) -> std::result::Result<Vec<HevcNalUnit>, VideoError>;
+    fn encode_frame(
+        &mut self,
+        frame: &Yuv420PlanarFrame,
+        is_keyframe: bool,
+    ) -> std::result::Result<Vec<HevcNalUnit>, VideoError>;
 
     /// Flushes delayed B/P frames from the hardware pipeline at end-of-stream.
     ///
@@ -211,7 +215,9 @@ impl std::fmt::Display for VideoEncoderBackend {
 ///
 /// # Errors
 /// Returns [`VideoError`] if the requested or platform hardware encoder is unavailable.
-pub fn probe_video_encoder_backend(config: &WiggleVideoConfig) -> std::result::Result<VideoEncoderBackend, VideoError> {
+pub fn probe_video_encoder_backend(
+    config: &WiggleVideoConfig,
+) -> std::result::Result<VideoEncoderBackend, VideoError> {
     let probe_cfg = HevcEncoderConfig {
         width: 320,
         height: 240,
@@ -321,7 +327,9 @@ impl WiggleVideoBuilder {
         writer: &mut W,
     ) -> Result<()> {
         if frames.is_empty() {
-            return Err(Error::Unknown("No frames provided for Wiggle MP4 video".into()));
+            return Err(Error::Unknown(
+                "No frames provided for Wiggle MP4 video".into(),
+            ));
         }
 
         let (width, height) = frames[0].dimensions();
@@ -334,10 +342,8 @@ impl WiggleVideoBuilder {
         }
 
         // 1. Convert RGBA frames to YUV420p Planar buffers
-        let yuv_frames: Vec<Yuv420PlanarFrame> = frames
-            .iter()
-            .map(RgbaToYuv420Converter::convert)
-            .collect();
+        let yuv_frames: Vec<Yuv420PlanarFrame> =
+            frames.iter().map(RgbaToYuv420Converter::convert).collect();
 
         let enc_width = yuv_frames[0].width;
         let enc_height = yuv_frames[0].height;
@@ -363,7 +369,9 @@ impl WiggleVideoBuilder {
             if config.fallback_to_mock {
                 tracing::warn!(error = %e, "Hardware video encoder failed on target resolution; falling back to software mock");
                 encoder = Box::new(SoftwareMockHevcEncoder::new());
-                encoder.initialize(&encoder_cfg).map_err(|err| Error::Unknown(err.to_string()))?;
+                encoder
+                    .initialize(&encoder_cfg)
+                    .map_err(|err| Error::Unknown(err.to_string()))?;
             } else {
                 return Err(Error::Unknown(format!(
                     "Failed to initialize HEVC video encoder ({backend}): {e}"
@@ -453,15 +461,15 @@ impl WiggleVideoBuilder {
         // Fallback parameter sets if encoder emitted in-band only
         if vps_data.is_empty() {
             vps_data = vec![
-                0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00,
-                0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x78, 0xAC, 0x09,
+                0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+                0x00, 0x00, 0x03, 0x00, 0x00, 0x78, 0xAC, 0x09,
             ];
         }
         if sps_data.is_empty() {
             sps_data = vec![
-                0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
-                0x03, 0x00, 0x00, 0x78, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16, 0x59, 0x5E, 0x49,
-                0x2B, 0x01, 0x01, 0x01, 0x40,
+                0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
+                0x00, 0x00, 0x78, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16, 0x59, 0x5E, 0x49, 0x2B, 0x01,
+                0x01, 0x01, 0x40,
             ];
         }
         if pps_data.is_empty() {
@@ -507,7 +515,9 @@ mod tests {
         img2.put_pixel(0, 0, Rgba([0, 0, 255, 255]));
 
         let frames = vec![img0, img1, img2];
-        let config = WiggleVideoConfig::new().with_mock_fallback(true).with_loops(2);
+        let config = WiggleVideoConfig::new()
+            .with_mock_fallback(true)
+            .with_loops(2);
 
         let mut mp4_bytes = Vec::new();
         WiggleVideoBuilder::build_wiggle_video(&frames, &config, &mut mp4_bytes)
@@ -558,7 +568,8 @@ mod tests {
     #[test]
     fn test_probe_video_encoder_backend_mock_fallback() {
         let config = WiggleVideoConfig::new().with_mock_fallback(true);
-        let backend = probe_video_encoder_backend(&config).expect("Probe with mock fallback should succeed");
+        let backend =
+            probe_video_encoder_backend(&config).expect("Probe with mock fallback should succeed");
         assert!(matches!(
             backend,
             VideoEncoderBackend::Nvenc

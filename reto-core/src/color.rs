@@ -250,7 +250,7 @@ impl RgbaToYuv420Converter {
     /// assert_eq!(yuv.height, 64);
     /// ```
     #[must_use]
-    #[allow(clippy::similar_names)]
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
     pub fn convert(rgba: &RgbaImage) -> Yuv420PlanarFrame {
         let (orig_w, orig_h) = rgba.dimensions();
         let target_w = (orig_w + 1) & !1;
@@ -309,11 +309,20 @@ impl RgbaToYuv420Converter {
                 let row0_start = y0_clamped * raw_stride;
                 let row1_start = y1 * raw_stride;
 
-                let row0_chunks = raw_rgba[row0_start..row0_start + raw_stride].as_chunks::<4>().0;
-                let row1_chunks = raw_rgba[row1_start..row1_start + raw_stride].as_chunks::<4>().0;
+                let row0_chunks = raw_rgba[row0_start..row0_start + raw_stride]
+                    .as_chunks::<4>()
+                    .0;
+                let row1_chunks = raw_rgba[row1_start..row1_start + raw_stride]
+                    .as_chunks::<4>()
+                    .0;
                 let max_x = row0_chunks.len().saturating_sub(1);
 
-                for (uv_x, (u_out, v_out)) in u_row.iter_mut().zip(v_row.iter_mut()).take(half_w).enumerate() {
+                for (uv_x, (u_out, v_out)) in u_row
+                    .iter_mut()
+                    .zip(v_row.iter_mut())
+                    .take(half_w)
+                    .enumerate()
+                {
                     let x0 = uv_x * 2;
                     let x1 = (x0 + 1).min(max_x);
                     let x0_clamped = x0.min(max_x);
@@ -323,15 +332,33 @@ impl RgbaToYuv420Converter {
                     let p10 = row1_chunks[x0_clamped];
                     let p11 = row1_chunks[x1];
 
-                    let avg_r = (f32::from(p00[0]) + f32::from(p01[0]) + f32::from(p10[0]) + f32::from(p11[0])) * 0.25;
-                    let avg_g = (f32::from(p00[1]) + f32::from(p01[1]) + f32::from(p10[1]) + f32::from(p11[1])) * 0.25;
-                    let avg_b = (f32::from(p00[2]) + f32::from(p01[2]) + f32::from(p10[2]) + f32::from(p11[2])) * 0.25;
+                    let avg_r = (f32::from(p00[0])
+                        + f32::from(p01[0])
+                        + f32::from(p10[0])
+                        + f32::from(p11[0]))
+                        * 0.25;
+                    let avg_g = (f32::from(p00[1])
+                        + f32::from(p01[1])
+                        + f32::from(p10[1])
+                        + f32::from(p11[1]))
+                        * 0.25;
+                    let avg_b = (f32::from(p00[2])
+                        + f32::from(p01[2])
+                        + f32::from(p10[2])
+                        + f32::from(p11[2]))
+                        * 0.25;
 
-                    *u_out = (u_weights[0] * avg_r + u_weights[1] * avg_g + u_weights[2] * avg_b + 128.0)
+                    *u_out = (u_weights[0] * avg_r
+                        + u_weights[1] * avg_g
+                        + u_weights[2] * avg_b
+                        + 128.0)
                         .round()
                         .clamp(0.0, 255.0) as u8;
 
-                    *v_out = (v_weights[0] * avg_r + v_weights[1] * avg_g + v_weights[2] * avg_b + 128.0)
+                    *v_out = (v_weights[0] * avg_r
+                        + v_weights[1] * avg_g
+                        + v_weights[2] * avg_b
+                        + 128.0)
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }

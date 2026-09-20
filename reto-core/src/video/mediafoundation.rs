@@ -2,9 +2,9 @@
 //!
 //! Provides native hardware acceleration on Windows 10/11 via Media Foundation transforms.
 
-use crate::color::Yuv420PlanarFrame;
 use super::mp4_muxer::HevcNalUnit;
 use super::{HevcEncoderConfig, HevcFrameEncoder, VideoError};
+use crate::color::Yuv420PlanarFrame;
 
 /// Windows Media Foundation HEVC hardware encoder.
 #[allow(dead_code)]

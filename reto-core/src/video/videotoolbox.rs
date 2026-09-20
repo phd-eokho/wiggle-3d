@@ -3,9 +3,9 @@
 //! Provides native hardware acceleration on Apple Silicon (M1/M2/M3/M4 Media Engine)
 //! and Intel T2 Macs via macOS system frameworks (`VTCompressionSession`).
 
-use crate::color::Yuv420PlanarFrame;
 use super::mp4_muxer::HevcNalUnit;
 use super::{HevcEncoderConfig, HevcFrameEncoder, VideoError};
+use crate::color::Yuv420PlanarFrame;
 
 /// Apple VideoToolbox HEVC hardware encoder for macOS.
 #[allow(dead_code)]

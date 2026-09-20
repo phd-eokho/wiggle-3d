@@ -227,13 +227,19 @@ impl ImageItemContext {
     }
 
     /// Sets the HEVC MP4 video generation configuration.
-    pub const fn set_video_config(&mut self, video_config: Option<crate::video::WiggleVideoConfig>) {
+    pub const fn set_video_config(
+        &mut self,
+        video_config: Option<crate::video::WiggleVideoConfig>,
+    ) {
         self.video_config = video_config;
     }
 
     /// Builder method to set HEVC MP4 video generation configuration.
     #[must_use]
-    pub const fn with_video_config(mut self, video_config: Option<crate::video::WiggleVideoConfig>) -> Self {
+    pub const fn with_video_config(
+        mut self,
+        video_config: Option<crate::video::WiggleVideoConfig>,
+    ) -> Self {
         self.video_config = video_config;
         self
     }

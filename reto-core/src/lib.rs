@@ -84,14 +84,14 @@ pub use stats::{
     matched_filter_1d, AxisPixelStats, AxisStatisticsProfile, GutterSpan, OptimalGridResult,
     ThresholdPartitionResult, DEFAULT_HIGH_PERCENTILE, DEFAULT_LOW_PERCENTILE,
 };
+pub use video::{
+    create_hevc_encoder, probe_video_encoder_backend, EncodedVideoSample, HevcEncoderConfig,
+    HevcFrameEncoder, HevcNalUnit, MediaFoundationHevcEncoder, Mp4Muxer, NvencHevcEncoder,
+    SoftwareMockHevcEncoder, VaapiHevcEncoder, VideoEncoderBackend, VideoError,
+    VideoToolboxHevcEncoder, WiggleVideoBuilder, WiggleVideoConfig, DEFAULT_MP4_CRF,
+    DEFAULT_MP4_LOOPS,
+};
 pub use visualizer::{
     FrameFaceRecord, RoiVisualizer, SaveFacesDiagnosticTap, SaveFeaturesDiagnosticTap,
     SaveMatchesDiagnosticTap,
 };
-pub use video::{
-    create_hevc_encoder, probe_video_encoder_backend, DEFAULT_MP4_CRF, DEFAULT_MP4_LOOPS,
-    EncodedVideoSample, HevcEncoderConfig, HevcFrameEncoder, HevcNalUnit, MediaFoundationHevcEncoder,
-    Mp4Muxer, NvencHevcEncoder, SoftwareMockHevcEncoder, VaapiHevcEncoder, VideoEncoderBackend,
-    VideoError, VideoToolboxHevcEncoder, WiggleVideoBuilder, WiggleVideoConfig,
-};
-

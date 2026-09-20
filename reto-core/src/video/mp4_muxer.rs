@@ -80,7 +80,12 @@ pub fn parse_annex_b_nalus(stream: &[u8]) -> Vec<HevcNalUnit> {
 
     while i < len {
         // Find start code prefix
-        let start_len = if i + 4 <= len && stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 0 && stream[i + 3] == 1 {
+        let start_len = if i + 4 <= len
+            && stream[i] == 0
+            && stream[i + 1] == 0
+            && stream[i + 2] == 0
+            && stream[i + 3] == 1
+        {
             4
         } else if i + 3 <= len && stream[i] == 0 && stream[i + 1] == 0 && stream[i + 2] == 1 {
             3
@@ -93,8 +98,15 @@ pub fn parse_annex_b_nalus(stream: &[u8]) -> Vec<HevcNalUnit> {
         let mut next_i = nal_start;
 
         while next_i < len {
-            if (next_i + 3 <= len && stream[next_i] == 0 && stream[next_i + 1] == 0 && stream[next_i + 2] == 1)
-                || (next_i + 4 <= len && stream[next_i] == 0 && stream[next_i + 1] == 0 && stream[next_i + 2] == 0 && stream[next_i + 3] == 1)
+            if (next_i + 3 <= len
+                && stream[next_i] == 0
+                && stream[next_i + 1] == 0
+                && stream[next_i + 2] == 1)
+                || (next_i + 4 <= len
+                    && stream[next_i] == 0
+                    && stream[next_i + 1] == 0
+                    && stream[next_i + 2] == 0
+                    && stream[next_i + 3] == 1)
             {
                 break;
             }
@@ -155,7 +167,9 @@ impl Mp4Muxer {
         writer: &mut W,
     ) -> Result<()> {
         if samples.is_empty() {
-            return Err(Error::Unknown("Cannot mux MP4 with zero video samples".into()));
+            return Err(Error::Unknown(
+                "Cannot mux MP4 with zero video samples".into(),
+            ));
         }
 
         let total_duration_ms: u64 = samples.iter().map(|s| u64::from(s.duration_ms)).sum();
@@ -182,7 +196,11 @@ impl Mp4Muxer {
 
             for nalu in &sample.nalus {
                 // Filter out out-of-band parameter sets if already in hvcC
-                if nalu.nal_type == NAL_VPS || nalu.nal_type == NAL_SPS || nalu.nal_type == NAL_PPS || nalu.nal_type == NAL_AUD {
+                if nalu.nal_type == NAL_VPS
+                    || nalu.nal_type == NAL_SPS
+                    || nalu.nal_type == NAL_PPS
+                    || nalu.nal_type == NAL_AUD
+                {
                     continue;
                 }
                 let nalu_len = nalu.data.len() as u32;
@@ -212,12 +230,8 @@ impl Mp4Muxer {
         mvhd.extend_from_slice(&0x00010000u32.to_be_bytes()); // rate = 1.0
         mvhd.extend_from_slice(&0x0100u16.to_be_bytes()); // volume = 1.0 (full volume)
         mvhd.extend_from_slice(&[0u8; 10]); // reserved
-        // 3x3 identity unity matrix
-        let matrix: [u32; 9] = [
-            0x00010000, 0, 0,
-            0, 0x00010000, 0,
-            0, 0, 0x40000000,
-        ];
+                                            // 3x3 identity unity matrix
+        let matrix: [u32; 9] = [0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000];
         for val in matrix {
             mvhd.extend_from_slice(&val.to_be_bytes());
         }
@@ -291,8 +305,12 @@ impl Mp4Muxer {
         // --- [hvcC] (HEVCDecoderConfigurationRecord) ---
         let mut hvcc = Vec::new();
         hvcc.push(1); // configurationVersion = 1
-        // Profile space (2), tier (1), profile_idc (5)
-        let profile_idc = if sps.len() > 1 { (sps[1] >> 1) & 0x1F } else { 1 };
+                      // Profile space (2), tier (1), profile_idc (5)
+        let profile_idc = if sps.len() > 1 {
+            (sps[1] >> 1) & 0x1F
+        } else {
+            1
+        };
         hvcc.push(profile_idc.clamp(1, 2)); // Main Profile
         hvcc.extend_from_slice(&0x60000000u32.to_be_bytes()); // general_profile_compatibility_flags
         hvcc.extend_from_slice(&[0u8; 6]); // general_constraint_indicator_flags
@@ -304,7 +322,7 @@ impl Mp4Muxer {
         hvcc.push(0xF8); // bit_depth_luma_minus8 (reserved 5 bits + 0)
         hvcc.push(0xF8); // bit_depth_chroma_minus8 (reserved 5 bits + 0)
         hvcc.extend_from_slice(&0u16.to_be_bytes()); // avgFrameRate = 0
-        // constantFrameRate(2)=0, numTemporalLayers(3)=1, temporalIdNested(1)=1, lengthSizeMinusOne(2)=3
+                                                     // constantFrameRate(2)=0, numTemporalLayers(3)=1, temporalIdNested(1)=1, lengthSizeMinusOne(2)=3
         hvcc.push(0x0F);
         // Arrays count: 3 (VPS, SPS, PPS)
         hvcc.push(3);
@@ -383,7 +401,11 @@ impl Mp4Muxer {
         let mut stss = Vec::new();
         stss.push(0); // version
         stss.extend_from_slice(&[0, 0, 0]); // flags
-        let effective_sync = if sync_samples.is_empty() { vec![1u32] } else { sync_samples };
+        let effective_sync = if sync_samples.is_empty() {
+            vec![1u32]
+        } else {
+            sync_samples
+        };
         stss.extend_from_slice(&(effective_sync.len() as u32).to_be_bytes());
         for sync_idx in effective_sync {
             stss.extend_from_slice(&sync_idx.to_be_bytes());
@@ -506,8 +528,12 @@ mod tests {
 
     #[test]
     fn test_mp4_muxing_structure() {
-        let vps = vec![0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00];
-        let sps = vec![0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78];
+        let vps = vec![
+            0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00,
+        ];
+        let sps = vec![
+            0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x78,
+        ];
         let pps = vec![0x44, 0x01, 0xC0, 0xF3, 0xC0];
 
         let samples = vec![

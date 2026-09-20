@@ -24,9 +24,9 @@
     clippy::non_send_fields_in_send_ty
 )]
 
-use crate::color::Yuv420PlanarFrame;
 use super::mp4_muxer::{parse_annex_b_nalus, HevcNalUnit};
 use super::{HevcEncoderConfig, HevcFrameEncoder, VideoError};
+use crate::color::Yuv420PlanarFrame;
 use std::ffi::{c_char, c_void, CStr, CString};
 
 type NVENCSTATUS = u32;
@@ -274,26 +274,43 @@ struct NV_ENC_PIC_PARAMS {
 struct NV_ENCODE_API_FUNCTION_LIST {
     version: u32,
     reserved: u32,
-    nvEncOpenEncodeSession: Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> NVENCSTATUS>,
+    nvEncOpenEncodeSession:
+        Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> NVENCSTATUS>,
     nvEncGetEncodeGUIDCount: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeProfileGUIDCount: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeProfileGUIDs: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeGUIDs: Option<unsafe extern "C" fn(*mut c_void, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetInputFormatCount: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
-    nvEncGetInputFormats: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodeProfileGUIDCount:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodeProfileGUIDs:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodeGUIDs:
+        Option<unsafe extern "C" fn(*mut c_void, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetInputFormatCount:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
+    nvEncGetInputFormats:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32, u32, *mut u32) -> NVENCSTATUS>,
     nvEncGetEncodeCaps: *mut c_void,
-    nvEncGetEncodePresetCount: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodePresetGUIDs: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodePresetConfig: Option<unsafe extern "C" fn(*mut c_void, GUID, GUID, *mut c_void) -> NVENCSTATUS>,
-    nvEncInitializeEncoder: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_INITIALIZE_PARAMS) -> NVENCSTATUS>,
-    nvEncCreateInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_INPUT_BUFFER) -> NVENCSTATUS>,
+    nvEncGetEncodePresetCount:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodePresetGUIDs:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodePresetConfig:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, GUID, *mut c_void) -> NVENCSTATUS>,
+    nvEncInitializeEncoder:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_INITIALIZE_PARAMS) -> NVENCSTATUS>,
+    nvEncCreateInputBuffer:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_INPUT_BUFFER) -> NVENCSTATUS>,
     nvEncDestroyInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncCreateBitstreamBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_BITSTREAM_BUFFER) -> NVENCSTATUS>,
-    nvEncDestroyBitstreamBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncEncodePicture: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_PIC_PARAMS) -> NVENCSTATUS>,
-    nvEncLockBitstream: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_BITSTREAM) -> NVENCSTATUS>,
+    nvEncCreateBitstreamBuffer: Option<
+        unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_BITSTREAM_BUFFER) -> NVENCSTATUS,
+    >,
+    nvEncDestroyBitstreamBuffer:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncEncodePicture:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_PIC_PARAMS) -> NVENCSTATUS>,
+    nvEncLockBitstream:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_BITSTREAM) -> NVENCSTATUS>,
     nvEncUnlockBitstream: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncLockInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_INPUT_BUFFER) -> NVENCSTATUS>,
+    nvEncLockInputBuffer:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_INPUT_BUFFER) -> NVENCSTATUS>,
     nvEncUnlockInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncGetEncodeStats: *mut c_void,
     nvEncGetSequenceParams: *mut c_void,
@@ -303,7 +320,12 @@ struct NV_ENCODE_API_FUNCTION_LIST {
     nvEncUnmapInputResource: *mut c_void,
     nvEncDestroyEncoder: Option<unsafe extern "C" fn(*mut c_void) -> NVENCSTATUS>,
     nvEncInvalidateRefFrames: *mut c_void,
-    nvEncOpenEncodeSessionEx: Option<unsafe extern "C" fn(*mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, *mut *mut c_void) -> NVENCSTATUS>,
+    nvEncOpenEncodeSessionEx: Option<
+        unsafe extern "C" fn(
+            *mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+            *mut *mut c_void,
+        ) -> NVENCSTATUS,
+    >,
     nvEncRegisterResource: *mut c_void,
     nvEncUnregisterResource: *mut c_void,
     nvEncReconfigureEncoder: *mut c_void,
@@ -313,14 +335,16 @@ struct NV_ENCODE_API_FUNCTION_LIST {
     nvEncRunMotionEstimationOnly: *mut c_void,
     nvEncGetLastErrorString: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
     nvEncSetIOCudaStreams: *mut c_void,
-    nvEncGetEncodePresetConfigEx: Option<unsafe extern "C" fn(*mut c_void, GUID, GUID, u32, *mut c_void) -> NVENCSTATUS>,
+    nvEncGetEncodePresetConfigEx:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, GUID, u32, *mut c_void) -> NVENCSTATUS>,
     nvEncGetSequenceParamEx: *mut c_void,
     nvEncRestoreEncoderState: *mut c_void,
     nvEncLookaheadPicture: *mut c_void,
     reserved2: [*mut c_void; 275],
 }
 
-type NvEncodeAPICreateInstanceFn = unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
+type NvEncodeAPICreateInstanceFn =
+    unsafe extern "C" fn(*mut NV_ENCODE_API_FUNCTION_LIST) -> NVENCSTATUS;
 type NvEncodeAPIGetMaxSupportedVersionFn = unsafe extern "C" fn(*mut u32) -> NVENCSTATUS;
 
 type CuInitFn = unsafe extern "C" fn(u32) -> u32;
@@ -354,7 +378,8 @@ impl DynamicNvencDriver {
 
             let mut cuda_lib = std::ptr::null_mut();
             for name in cuda_names {
-                let cname = CString::new(name).map_err(|e| VideoError::NvencUnavailable(e.to_string()))?;
+                let cname =
+                    CString::new(name).map_err(|e| VideoError::NvencUnavailable(e.to_string()))?;
                 let handle = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
                 if !handle.is_null() {
                     cuda_lib = handle;
@@ -408,7 +433,9 @@ impl DynamicNvencDriver {
             let mut device: i32 = 0;
             if cu_dev_get(&mut device, 0) != 0 {
                 libc::dlclose(cuda_lib);
-                return Err(VideoError::NvencUnavailable("cuDeviceGet(&dev, 0) failed".into()));
+                return Err(VideoError::NvencUnavailable(
+                    "cuDeviceGet(&dev, 0) failed".into(),
+                ));
             }
 
             let sym_ctx_set = libc::dlsym(cuda_lib, b"cuCtxSetCurrent\0".as_ptr().cast());
@@ -420,7 +447,8 @@ impl DynamicNvencDriver {
             }
 
             if !sym_ctx_set.is_null() {
-                let cu_ctx_set: unsafe extern "C" fn(*mut c_void) -> u32 = std::mem::transmute(sym_ctx_set);
+                let cu_ctx_set: unsafe extern "C" fn(*mut c_void) -> u32 =
+                    std::mem::transmute(sym_ctx_set);
                 let _ = cu_ctx_set(cu_ctx);
             }
 
@@ -436,7 +464,8 @@ impl DynamicNvencDriver {
 
             let mut nvenc_lib = std::ptr::null_mut();
             for name in nvenc_names {
-                let cname = CString::new(name).map_err(|e| VideoError::NvencUnavailable(e.to_string()))?;
+                let cname =
+                    CString::new(name).map_err(|e| VideoError::NvencUnavailable(e.to_string()))?;
                 let handle = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
                 if !handle.is_null() {
                     nvenc_lib = handle;
@@ -450,12 +479,17 @@ impl DynamicNvencDriver {
                 }
                 libc::dlclose(cuda_lib);
                 return Err(VideoError::NvencUnavailable(
-                    "NVIDIA NVENC library (libnvidia-encode.so.1 / nvEncodeAPI64.dll) not found".into(),
+                    "NVIDIA NVENC library (libnvidia-encode.so.1 / nvEncodeAPI64.dll) not found"
+                        .into(),
                 ));
             }
 
-            let create_instance_sym = libc::dlsym(nvenc_lib, b"NvEncodeAPICreateInstance\0".as_ptr().cast());
-            let get_max_ver_sym = libc::dlsym(nvenc_lib, b"NvEncodeAPIGetMaxSupportedVersion\0".as_ptr().cast());
+            let create_instance_sym =
+                libc::dlsym(nvenc_lib, b"NvEncodeAPICreateInstance\0".as_ptr().cast());
+            let get_max_ver_sym = libc::dlsym(
+                nvenc_lib,
+                b"NvEncodeAPIGetMaxSupportedVersion\0".as_ptr().cast(),
+            );
 
             if create_instance_sym.is_null() {
                 if let Some(destroy) = cu_ctx_destroy {
@@ -470,11 +504,13 @@ impl DynamicNvencDriver {
 
             let mut max_ver: u32 = 0;
             if !get_max_ver_sym.is_null() {
-                let get_max_ver: NvEncodeAPIGetMaxSupportedVersionFn = std::mem::transmute(get_max_ver_sym);
+                let get_max_ver: NvEncodeAPIGetMaxSupportedVersionFn =
+                    std::mem::transmute(get_max_ver_sym);
                 let _ = get_max_ver(&mut max_ver);
             }
 
-            let create_instance: NvEncodeAPICreateInstanceFn = std::mem::transmute(create_instance_sym);
+            let create_instance: NvEncodeAPICreateInstanceFn =
+                std::mem::transmute(create_instance_sym);
             let mut funcs: NV_ENCODE_API_FUNCTION_LIST = std::mem::zeroed();
 
             const fn make_nvenc_struct_ver(major: u32, minor: u32, ver: u32) -> u32 {
@@ -604,12 +640,12 @@ impl HevcFrameEncoder for NvencHevcEncoder {
 
         unsafe {
             let open_session_ex = driver.funcs.nvEncOpenEncodeSessionEx.ok_or_else(|| {
-                VideoError::NvencUnavailable("nvEncOpenEncodeSessionEx function pointer missing".into())
+                VideoError::NvencUnavailable(
+                    "nvEncOpenEncodeSessionEx function pointer missing".into(),
+                )
             })?;
 
-            let struct_ver = |ver: u32| -> u32 {
-                driver.api_version | (ver << 16) | (0x7 << 28)
-            };
+            let struct_ver = |ver: u32| -> u32 { driver.api_version | (ver << 16) | (0x7 << 28) };
 
             let mut session_params: NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS = std::mem::zeroed();
             session_params.version = struct_ver(1);
@@ -623,7 +659,8 @@ impl HevcFrameEncoder for NvencHevcEncoder {
             if session_status != NV_ENC_SUCCESS || encoder_ptr.is_null() {
                 if let Some(open_session) = driver.funcs.nvEncOpenEncodeSession {
                     encoder_ptr = std::ptr::null_mut();
-                    let status = open_session(driver.cu_ctx, NV_ENC_DEVICE_TYPE_CUDA, &mut encoder_ptr);
+                    let status =
+                        open_session(driver.cu_ctx, NV_ENC_DEVICE_TYPE_CUDA, &mut encoder_ptr);
                     if status == NV_ENC_SUCCESS && !encoder_ptr.is_null() {
                         session_status = NV_ENC_SUCCESS;
                     }
@@ -640,14 +677,33 @@ impl HevcFrameEncoder for NvencHevcEncoder {
             let mut preset_count = 0u32;
             let mut selected_preset = NV_ENC_PRESET_P7_GUID;
             if let Some(get_preset_count) = driver.funcs.nvEncGetEncodePresetCount {
-                let status = get_preset_count(encoder_ptr, NV_ENC_CODEC_HEVC_GUID, &mut preset_count);
+                let status =
+                    get_preset_count(encoder_ptr, NV_ENC_CODEC_HEVC_GUID, &mut preset_count);
                 if status == NV_ENC_SUCCESS && preset_count > 0 {
-                    let mut presets = vec![GUID { data1: 0, data2: 0, data3: 0, data4: [0; 8] }; preset_count as usize];
+                    let mut presets = vec![
+                        GUID {
+                            data1: 0,
+                            data2: 0,
+                            data3: 0,
+                            data4: [0; 8]
+                        };
+                        preset_count as usize
+                    ];
                     let mut actual = 0u32;
                     if let Some(get_presets) = driver.funcs.nvEncGetEncodePresetGUIDs {
-                        let _ = get_presets(encoder_ptr, NV_ENC_CODEC_HEVC_GUID, presets.as_mut_ptr(), preset_count, &mut actual);
+                        let _ = get_presets(
+                            encoder_ptr,
+                            NV_ENC_CODEC_HEVC_GUID,
+                            presets.as_mut_ptr(),
+                            preset_count,
+                            &mut actual,
+                        );
                         if !presets.is_empty() {
-                            selected_preset = presets.iter().copied().find(|p| *p == NV_ENC_PRESET_P7_GUID).unwrap_or(presets[0]);
+                            selected_preset = presets
+                                .iter()
+                                .copied()
+                                .find(|p| *p == NV_ENC_PRESET_P7_GUID)
+                                .unwrap_or(presets[0]);
                         }
                     }
                 }
@@ -766,29 +822,35 @@ impl HevcFrameEncoder for NvencHevcEncoder {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn encode_frame(&mut self, frame: &Yuv420PlanarFrame, is_keyframe: bool) -> Result<Vec<HevcNalUnit>, VideoError> {
-        let driver = self.driver.as_ref().ok_or_else(|| {
-            VideoError::NvencError("Encoder not initialized".into())
-        })?;
+    fn encode_frame(
+        &mut self,
+        frame: &Yuv420PlanarFrame,
+        is_keyframe: bool,
+    ) -> Result<Vec<HevcNalUnit>, VideoError> {
+        let driver = self
+            .driver
+            .as_ref()
+            .ok_or_else(|| VideoError::NvencError("Encoder not initialized".into()))?;
 
         unsafe {
-            let struct_ver = |ver: u32| -> u32 {
-                driver.api_version | (ver << 16) | (0x7 << 28)
-            };
+            let struct_ver = |ver: u32| -> u32 { driver.api_version | (ver << 16) | (0x7 << 28) };
 
             // Lock input buffer
             let mut lock_in: NV_ENC_LOCK_INPUT_BUFFER = std::mem::zeroed();
             lock_in.version = struct_ver(1);
             lock_in.inputBuffer = self.input_buffer;
 
-            let lock_input = driver.funcs.nvEncLockInputBuffer.ok_or_else(|| {
-                VideoError::NvencError("nvEncLockInputBuffer missing".into())
-            })?;
+            let lock_input = driver
+                .funcs
+                .nvEncLockInputBuffer
+                .ok_or_else(|| VideoError::NvencError("nvEncLockInputBuffer missing".into()))?;
 
             let status = lock_input(self.encoder, &mut lock_in);
             if status != NV_ENC_SUCCESS {
                 let err_str = driver.get_last_error(self.encoder);
-                return Err(VideoError::NvencError(format!("nvEncLockInputBuffer failed ({status}): {err_str}")));
+                return Err(VideoError::NvencError(format!(
+                    "nvEncLockInputBuffer failed ({status}): {err_str}"
+                )));
             }
 
             let dst_ptr = lock_in.bufferDataPtr as *mut u8;
@@ -833,9 +895,10 @@ impl HevcFrameEncoder for NvencHevcEncoder {
                 );
             }
 
-            let unlock_input = driver.funcs.nvEncUnlockInputBuffer.ok_or_else(|| {
-                VideoError::NvencError("nvEncUnlockInputBuffer missing".into())
-            })?;
+            let unlock_input = driver
+                .funcs
+                .nvEncUnlockInputBuffer
+                .ok_or_else(|| VideoError::NvencError("nvEncUnlockInputBuffer missing".into()))?;
             unlock_input(self.encoder, self.input_buffer);
 
             // Encode Picture
@@ -853,12 +916,15 @@ impl HevcFrameEncoder for NvencHevcEncoder {
                 pic_params.encodePicFlags = 0x00000002 /* FORCEIDR */ | 0x00000004 /* OUTPUT_SPSPPS */;
             }
 
-            let encode_pic = driver.funcs.nvEncEncodePicture.ok_or_else(|| {
-                VideoError::NvencError("nvEncEncodePicture missing".into())
-            })?;
+            let encode_pic = driver
+                .funcs
+                .nvEncEncodePicture
+                .ok_or_else(|| VideoError::NvencError("nvEncEncodePicture missing".into()))?;
 
             let mut status = encode_pic(self.encoder, &mut pic_params);
-            if status == 17 /* NV_ENC_ERR_NEED_MORE_INPUT */ {
+            if status == 17
+            /* NV_ENC_ERR_NEED_MORE_INPUT */
+            {
                 self.frame_index += 1;
                 return Ok(Vec::new());
             }
@@ -872,7 +938,9 @@ impl HevcFrameEncoder for NvencHevcEncoder {
             }
             if status != NV_ENC_SUCCESS {
                 let err_str = driver.get_last_error(self.encoder);
-                return Err(VideoError::NvencError(format!("nvEncEncodePicture failed ({status}): {err_str}")));
+                return Err(VideoError::NvencError(format!(
+                    "nvEncEncodePicture failed ({status}): {err_str}"
+                )));
             }
 
             // Lock bitstream to read encoded NAL units
@@ -880,9 +948,10 @@ impl HevcFrameEncoder for NvencHevcEncoder {
             lock_bs.version = struct_ver(2);
             lock_bs.outputBitstream = self.bitstream_buffer;
 
-            let lock_bitstream = driver.funcs.nvEncLockBitstream.ok_or_else(|| {
-                VideoError::NvencError("nvEncLockBitstream missing".into())
-            })?;
+            let lock_bitstream = driver
+                .funcs
+                .nvEncLockBitstream
+                .ok_or_else(|| VideoError::NvencError("nvEncLockBitstream missing".into()))?;
 
             let mut status = lock_bitstream(self.encoder, &mut lock_bs);
             if status != NV_ENC_SUCCESS {
@@ -891,10 +960,13 @@ impl HevcFrameEncoder for NvencHevcEncoder {
             }
             if status != NV_ENC_SUCCESS {
                 let err_str = driver.get_last_error(self.encoder);
-                return Err(VideoError::NvencError(format!("nvEncLockBitstream failed ({status}): {err_str}")));
+                return Err(VideoError::NvencError(format!(
+                    "nvEncLockBitstream failed ({status}): {err_str}"
+                )));
             }
 
-            let nalus = if lock_bs.bitstreamSizeInBytes > 0 && !lock_bs.bitstreamBufferPtr.is_null() {
+            let nalus = if lock_bs.bitstreamSizeInBytes > 0 && !lock_bs.bitstreamBufferPtr.is_null()
+            {
                 let bitstream_slice = std::slice::from_raw_parts(
                     lock_bs.bitstreamBufferPtr as *const u8,
                     lock_bs.bitstreamSizeInBytes as usize,
@@ -904,9 +976,10 @@ impl HevcFrameEncoder for NvencHevcEncoder {
                 Vec::new()
             };
 
-            let unlock_bitstream = driver.funcs.nvEncUnlockBitstream.ok_or_else(|| {
-                VideoError::NvencError("nvEncUnlockBitstream missing".into())
-            })?;
+            let unlock_bitstream = driver
+                .funcs
+                .nvEncUnlockBitstream
+                .ok_or_else(|| VideoError::NvencError("nvEncUnlockBitstream missing".into()))?;
             unlock_bitstream(self.encoder, self.bitstream_buffer);
 
             self.frame_index += 1;
@@ -920,9 +993,7 @@ impl HevcFrameEncoder for NvencHevcEncoder {
         };
 
         unsafe {
-            let struct_ver = |ver: u32| -> u32 {
-                driver.api_version | (ver << 16) | (0x7 << 28)
-            };
+            let struct_ver = |ver: u32| -> u32 { driver.api_version | (ver << 16) | (0x7 << 28) };
 
             let mut pic_params: NV_ENC_PIC_PARAMS = std::mem::zeroed();
             pic_params.version = struct_ver(7) | (1 << 31);
