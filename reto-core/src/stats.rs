@@ -318,7 +318,11 @@ fn find_scan_margins(
 
     let mut margin_start = 0_usize;
     while margin_start < margin_max
-        && f32::from(stats[margin_start].p98.saturating_sub(stats[margin_start].p5)) <= margin_thresh
+        && f32::from(
+            stats[margin_start]
+                .p98
+                .saturating_sub(stats[margin_start].p5),
+        ) <= margin_thresh
     {
         margin_start += 1;
     }
@@ -381,8 +385,7 @@ impl AxisStatisticsProfile {
         let nominal_pitch = l as f32 / n as f32;
 
         let diffs = self.p98_minus_p5_series();
-        let (gutter_centers, gutters, total_score) =
-            find_gutter_spans(&diffs, l, n, nominal_pitch);
+        let (gutter_centers, gutters, total_score) = find_gutter_spans(&diffs, l, n, nominal_pitch);
 
         let avg_gutter_min = total_score / (n - 1) as f32;
         let (margin_start, margin_end) =
@@ -453,9 +456,7 @@ fn validate_threshold_runs(
     true
 }
 
-fn select_plateau_runs(
-    valid_thresholds: &[ThresholdResult],
-) -> Option<ThresholdResult> {
+fn select_plateau_runs(valid_thresholds: &[ThresholdResult]) -> Option<ThresholdResult> {
     let mut plateau_counts: std::collections::HashMap<Vec<usize>, usize> =
         std::collections::HashMap::new();
     for (_, runs) in valid_thresholds {
@@ -470,17 +471,22 @@ fn select_plateau_runs(
         .collect();
 
     if stable_signatures.is_empty() {
-        let (most_frequent_sig, _) =
-            plateau_counts.into_iter().max_by_key(|&(_, count)| count)?;
-        valid_thresholds.iter().find(|&(_, runs)| {
-            let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
-            sig == most_frequent_sig
-        }).cloned()
+        let (most_frequent_sig, _) = plateau_counts.into_iter().max_by_key(|&(_, count)| count)?;
+        valid_thresholds
+            .iter()
+            .find(|&(_, runs)| {
+                let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
+                sig == most_frequent_sig
+            })
+            .cloned()
     } else {
-        valid_thresholds.iter().find(|&(_, runs)| {
-            let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
-            stable_signatures.contains(&sig)
-        }).cloned()
+        valid_thresholds
+            .iter()
+            .find(|&(_, runs)| {
+                let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
+                stable_signatures.contains(&sig)
+            })
+            .cloned()
     }
 }
 
@@ -529,7 +535,14 @@ impl AxisStatisticsProfile {
         let mut valid_thresholds = Vec::new();
         for t in (min_d + 1)..=max_d {
             let runs = run_length_threshold(&diffs, t);
-            if validate_threshold_runs(&runs, n, min_frame_w, max_frame_w, min_gutter_w, max_gutter_w) {
+            if validate_threshold_runs(
+                &runs,
+                n,
+                min_frame_w,
+                max_frame_w,
+                min_gutter_w,
+                max_gutter_w,
+            ) {
                 valid_thresholds.push((t, runs));
             }
         }

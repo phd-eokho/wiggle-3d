@@ -567,8 +567,7 @@ unsafe fn load_nvenc_function_table() -> Result<NvencFunctionTable, VideoError> 
             let _ = get_max_ver(&mut max_ver);
         }
 
-        let create_instance: NvEncodeAPICreateInstanceFn =
-            std::mem::transmute(create_instance_sym);
+        let create_instance: NvEncodeAPICreateInstanceFn = std::mem::transmute(create_instance_sym);
         let mut funcs: NV_ENCODE_API_FUNCTION_LIST = std::mem::zeroed();
 
         let test_api_pairs = [
@@ -714,8 +713,7 @@ impl HevcFrameEncoder for NvencHevcEncoder {
             let (selected_preset, preset_cfg) =
                 query_preset_and_config(&driver, encoder_ptr, config);
             init_nvenc_encoder(&driver, encoder_ptr, config, selected_preset, preset_cfg)?;
-            let (input_buf, bitstream_buf) =
-                allocate_nvenc_buffers(&driver, encoder_ptr, config)?;
+            let (input_buf, bitstream_buf) = allocate_nvenc_buffers(&driver, encoder_ptr, config)?;
 
             self.driver = Some(driver);
             self.encoder = encoder_ptr;
@@ -848,8 +846,7 @@ unsafe fn open_nvenc_session(driver: &DynamicNvencDriver) -> Result<*mut c_void,
         if session_status != NV_ENC_SUCCESS || encoder_ptr.is_null() {
             if let Some(open_session) = driver.funcs.nvEncOpenEncodeSession {
                 encoder_ptr = std::ptr::null_mut();
-                let status =
-                    open_session(driver.cu_ctx, NV_ENC_DEVICE_TYPE_CUDA, &mut encoder_ptr);
+                let status = open_session(driver.cu_ctx, NV_ENC_DEVICE_TYPE_CUDA, &mut encoder_ptr);
                 if status == NV_ENC_SUCCESS && !encoder_ptr.is_null() {
                     session_status = NV_ENC_SUCCESS;
                 }
@@ -963,9 +960,10 @@ unsafe fn init_nvenc_encoder(
             init_params.encodeConfig = std::ptr::addr_of_mut!(cfg.presetCfg).cast();
         }
 
-        let init_encoder = driver.funcs.nvEncInitializeEncoder.ok_or_else(|| {
-            VideoError::NvencUnavailable("nvEncInitializeEncoder missing".into())
-        })?;
+        let init_encoder = driver
+            .funcs
+            .nvEncInitializeEncoder
+            .ok_or_else(|| VideoError::NvencUnavailable("nvEncInitializeEncoder missing".into()))?;
 
         let mut status = init_encoder(encoder_ptr, &mut init_params);
         if status != NV_ENC_SUCCESS {
@@ -996,9 +994,10 @@ unsafe fn allocate_nvenc_buffers(
         create_in.height = config.height;
         create_in.bufferFmt = NV_ENC_BUFFER_FORMAT_IYUV;
 
-        let create_input_buf = driver.funcs.nvEncCreateInputBuffer.ok_or_else(|| {
-            VideoError::NvencUnavailable("nvEncCreateInputBuffer missing".into())
-        })?;
+        let create_input_buf = driver
+            .funcs
+            .nvEncCreateInputBuffer
+            .ok_or_else(|| VideoError::NvencUnavailable("nvEncCreateInputBuffer missing".into()))?;
 
         let mut status = create_input_buf(encoder_ptr, &mut create_in);
         if status != NV_ENC_SUCCESS {

@@ -233,7 +233,11 @@ fn group_bins_into_clusters(
     clusters
 }
 
-#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn find_target_foreground_bin(
     populated_bins: &[i32],
     bin_map: &std::collections::BTreeMap<i32, Vec<usize>>,
@@ -317,7 +321,8 @@ impl HistogramClusteringResult {
             return None;
         }
 
-        let clusters = group_bins_into_clusters(&populated_bins, effective_bin_size, effective_tolerance);
+        let clusters =
+            group_bins_into_clusters(&populated_bins, effective_bin_size, effective_tolerance);
         let target_bin = find_target_foreground_bin(&populated_bins, &bin_map, items.len());
         let target_cluster_idx = select_target_cluster(&clusters, target_bin, &bin_map);
 
@@ -338,7 +343,11 @@ struct TripletDisplacement {
     dy_21: f32,
 }
 
-#[allow(clippy::suboptimal_flops, clippy::similar_names, clippy::imprecise_flops)]
+#[allow(
+    clippy::suboptimal_flops,
+    clippy::similar_names,
+    clippy::imprecise_flops
+)]
 fn collect_triplet_displacements(
     features: &[FeatureFrame],
     triplets: &[FeatureTriplet],
@@ -914,10 +923,7 @@ impl WiggleAligner {
     /// * `bin_size` - Disparity histogram bin width in pixels.
     /// * `cluster_tolerance` - Maximum gap between bins to belong to the same depth surface.
     #[must_use]
-    #[allow(
-        clippy::imprecise_flops,
-        clippy::suboptimal_flops
-    )]
+    #[allow(clippy::imprecise_flops, clippy::suboptimal_flops)]
     pub fn compute_depth_surface_shifts_from_pairs(
         features: &[FeatureFrame],
         pairwise_matches: &[(FramePair, Vec<FeatureMatch>)],
@@ -944,9 +950,21 @@ impl WiggleAligner {
 
         for ((idx_a, idx_b), matches) in pairwise_matches {
             if *idx_a == 0 && *idx_b == 1 && !matches.is_empty() {
-                shift_0 = calculate_pair_surface_shift(matches, &features[0], &features[1], effective_bin_size, effective_tolerance);
+                shift_0 = calculate_pair_surface_shift(
+                    matches,
+                    &features[0],
+                    &features[1],
+                    effective_bin_size,
+                    effective_tolerance,
+                );
             } else if *idx_a == 1 && *idx_b == 2 && !matches.is_empty() {
-                shift_2 = calculate_pair_surface_shift(matches, &features[2], &features[1], effective_bin_size, effective_tolerance);
+                shift_2 = calculate_pair_surface_shift(
+                    matches,
+                    &features[2],
+                    &features[1],
+                    effective_bin_size,
+                    effective_tolerance,
+                );
             }
         }
 

@@ -227,8 +227,8 @@ struct VaapiDynamicLib {
 #[cfg(target_os = "linux")]
 impl VaapiDynamicLib {
     unsafe fn load() -> Result<Self, VideoError> {
-        let va_name = CString::new("libva.so.2")
-            .map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
+        let va_name =
+            CString::new("libva.so.2").map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
         let va_lib = unsafe { libc::dlopen(va_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if va_lib.is_null() {
             return Err(VideoError::VaapiUnavailable(
@@ -238,7 +238,8 @@ impl VaapiDynamicLib {
 
         let va_drm_name = CString::new("libva-drm.so.2")
             .map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
-        let va_drm_lib = unsafe { libc::dlopen(va_drm_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        let va_drm_lib =
+            unsafe { libc::dlopen(va_drm_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
         if va_drm_lib.is_null() {
             unsafe { libc::dlclose(va_lib) };
             return Err(VideoError::VaapiUnavailable(
@@ -246,7 +247,8 @@ impl VaapiDynamicLib {
             ));
         }
 
-        let sym_get_display = unsafe { libc::dlsym(va_drm_lib, b"vaGetDisplayDRM\0".as_ptr().cast()) };
+        let sym_get_display =
+            unsafe { libc::dlsym(va_drm_lib, b"vaGetDisplayDRM\0".as_ptr().cast()) };
         let sym_init = unsafe { libc::dlsym(va_lib, b"vaInitialize\0".as_ptr().cast()) };
         let sym_create_config = unsafe { libc::dlsym(va_lib, b"vaCreateConfig\0".as_ptr().cast()) };
         let sym_create_ctx = unsafe { libc::dlsym(va_lib, b"vaCreateContext\0".as_ptr().cast()) };
@@ -366,4 +368,3 @@ unsafe fn destroy_config(va_lib: *mut c_void, dpy: VADisplay, config_id: VAConfi
         }
     }
 }
-

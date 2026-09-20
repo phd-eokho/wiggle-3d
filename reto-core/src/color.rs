@@ -317,35 +317,25 @@ fn subsample_uv_planes(
                 let p10 = row1_chunks[x0_clamped];
                 let p11 = row1_chunks[x1];
 
-                let avg_r = (f32::from(p00[0])
-                    + f32::from(p01[0])
-                    + f32::from(p10[0])
-                    + f32::from(p11[0]))
-                    * 0.25;
-                let avg_g = (f32::from(p00[1])
-                    + f32::from(p01[1])
-                    + f32::from(p10[1])
-                    + f32::from(p11[1]))
-                    * 0.25;
-                let avg_b = (f32::from(p00[2])
-                    + f32::from(p01[2])
-                    + f32::from(p10[2])
-                    + f32::from(p11[2]))
-                    * 0.25;
+                let avg_r =
+                    (f32::from(p00[0]) + f32::from(p01[0]) + f32::from(p10[0]) + f32::from(p11[0]))
+                        * 0.25;
+                let avg_g =
+                    (f32::from(p00[1]) + f32::from(p01[1]) + f32::from(p10[1]) + f32::from(p11[1]))
+                        * 0.25;
+                let avg_b =
+                    (f32::from(p00[2]) + f32::from(p01[2]) + f32::from(p10[2]) + f32::from(p11[2]))
+                        * 0.25;
 
-                *u_out = (u_weights[0] * avg_r
-                    + u_weights[1] * avg_g
-                    + u_weights[2] * avg_b
-                    + 128.0)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                *u_out =
+                    (u_weights[0] * avg_r + u_weights[1] * avg_g + u_weights[2] * avg_b + 128.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
 
-                *v_out = (v_weights[0] * avg_r
-                    + v_weights[1] * avg_g
-                    + v_weights[2] * avg_b
-                    + 128.0)
-                    .round()
-                    .clamp(0.0, 255.0) as u8;
+                *v_out =
+                    (v_weights[0] * avg_r + v_weights[1] * avg_g + v_weights[2] * avg_b + 128.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
             }
 
             if half_w < u_row.len() && half_w > 0 {
@@ -391,7 +381,14 @@ impl RgbaToYuv420Converter {
 
         let [y_weights, u_weights, v_weights] = BT709_YUV_MATRIX;
 
-        extract_y_plane(raw_rgba, orig_w, orig_h, &mut frame.y_plane, y_stride, y_weights);
+        extract_y_plane(
+            raw_rgba,
+            orig_w,
+            orig_h,
+            &mut frame.y_plane,
+            y_stride,
+            y_weights,
+        );
         subsample_uv_planes(
             raw_rgba,
             orig_w,

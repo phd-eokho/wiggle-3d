@@ -1284,8 +1284,7 @@ impl HierarchicalReductionTree {
         let (active_spans, pruned_branches_count, max_level, rmse_before_px) =
             screen_and_prune_branches(&self.spans, config.tolerance.max_branch_residual_px);
 
-        let (initial_pos_x, initial_pos_y) =
-            compute_initial_baseline_positions(n, &active_spans);
+        let (initial_pos_x, initial_pos_y) = compute_initial_baseline_positions(n, &active_spans);
 
         let (pos_x_solved, pos_y_solved, solver_failed) = run_irls_iterations(
             n,
@@ -1376,10 +1375,7 @@ fn build_pairwise_observation_map(
     obs_map
 }
 
-fn generate_dyadic_spans(
-    n: usize,
-    obs_map: &PairObservationMap,
-) -> Vec<DyadicSpan> {
+fn generate_dyadic_spans(n: usize, obs_map: &PairObservationMap) -> Vec<DyadicSpan> {
     let mut spans = Vec::new();
     let mut stride = 1usize;
     let mut level = 0usize;
@@ -1413,7 +1409,11 @@ fn generate_dyadic_spans(
         level += 1;
     }
 
-    if n > 2 && !spans.iter().any(|s| s.start_frame == 0 && s.end_frame == n - 1) {
+    if n > 2
+        && !spans
+            .iter()
+            .any(|s| s.start_frame == 0 && s.end_frame == n - 1)
+    {
         let mid = n / 2;
         let (obs, count) = obs_map.get(&(0, n - 1)).copied().unwrap_or(((0.0, 0.0), 0));
         let status = if count > 0 {
@@ -1483,10 +1483,7 @@ fn screen_and_prune_branches(
 
     for s in &mut active_spans {
         max_level = max_level.max(s.level);
-        if s.level > 0
-            && s.match_count > 0
-            && s.chord_residual_px > max_branch_residual_px
-        {
+        if s.level > 0 && s.match_count > 0 && s.chord_residual_px > max_branch_residual_px {
             s.status = BranchStatus::Pruned;
             pruned_branches_count += 1;
             tracing::warn!(
@@ -1512,22 +1509,22 @@ fn screen_and_prune_branches(
         0.0
     };
 
-    (active_spans, pruned_branches_count, max_level, rmse_before_px)
+    (
+        active_spans,
+        pruned_branches_count,
+        max_level,
+        rmse_before_px,
+    )
 }
 
-fn compute_initial_baseline_positions(
-    n: usize,
-    spans: &[DyadicSpan],
-) -> (Vec<f32>, Vec<f32>) {
+fn compute_initial_baseline_positions(n: usize, spans: &[DyadicSpan]) -> (Vec<f32>, Vec<f32>) {
     let mut initial_pos_x = vec![0.0_f32; n];
     let mut initial_pos_y = vec![0.0_f32; n];
 
     for s in spans {
         if s.level == 0 && s.start_frame + 1 == s.end_frame {
-            initial_pos_x[s.end_frame] =
-                initial_pos_x[s.start_frame] + s.observed_translation.0;
-            initial_pos_y[s.end_frame] =
-                initial_pos_y[s.start_frame] + s.observed_translation.1;
+            initial_pos_x[s.end_frame] = initial_pos_x[s.start_frame] + s.observed_translation.0;
+            initial_pos_y[s.end_frame] = initial_pos_y[s.start_frame] + s.observed_translation.1;
         }
     }
     (initial_pos_x, initial_pos_y)
@@ -1571,8 +1568,16 @@ fn accumulate_irls_constraints(
         let huber_w = if r <= delta { 1.0 } else { delta / r };
         let w = (s.match_count as f32).sqrt() * huber_w;
 
-        let idx_end = if s.end_frame > 0 { Some(s.end_frame - 1) } else { None };
-        let idx_start = if s.start_frame > 0 { Some(s.start_frame - 1) } else { None };
+        let idx_end = if s.end_frame > 0 {
+            Some(s.end_frame - 1)
+        } else {
+            None
+        };
+        let idx_start = if s.start_frame > 0 {
+            Some(s.start_frame - 1)
+        } else {
+            None
+        };
 
         if let Some(ie) = idx_end {
             g_flat[ie] += w * target;
@@ -1607,8 +1612,16 @@ fn accumulate_irls_constraints(
             let huber_w = if r <= delta { 1.0 } else { delta / r };
             let w = config.chord_consistency_weight * huber_w;
 
-            let idx_end = if s.end_frame > 0 { Some(s.end_frame - 1) } else { None };
-            let idx_start = if s.start_frame > 0 { Some(s.start_frame - 1) } else { None };
+            let idx_end = if s.end_frame > 0 {
+                Some(s.end_frame - 1)
+            } else {
+                None
+            };
+            let idx_start = if s.start_frame > 0 {
+                Some(s.start_frame - 1)
+            } else {
+                None
+            };
 
             if let Some(ie) = idx_end {
                 g_flat[ie] += w * target;
@@ -1709,10 +1722,16 @@ fn check_optimization_fallback(
     config: &HierarchicalExtrinsicsConfig,
 ) -> (bool, Option<String>) {
     if solver_failed {
-        return (true, Some("Linear solver singularity / ill-conditioned matrix".to_string()));
+        return (
+            true,
+            Some("Linear solver singularity / ill-conditioned matrix".to_string()),
+        );
     }
     if pos_x.iter().any(|v| !v.is_finite()) || pos_y.iter().any(|v| !v.is_finite()) {
-        return (true, Some("Non-finite camera positions detected after optimization".to_string()));
+        return (
+            true,
+            Some("Non-finite camera positions detected after optimization".to_string()),
+        );
     }
     if config.tolerance.enforce_monotonicity && n >= 2 {
         let nominal_total = initial_pos_x[n - 1] - initial_pos_x[0];
@@ -1849,7 +1868,13 @@ fn assemble_optimization_report(
     let level_rmse_px: Vec<f32> = level_sq
         .iter()
         .zip(level_cnt.iter())
-        .map(|(&sq, &cnt)| if cnt > 0 { (sq / cnt as f32).sqrt() } else { 0.0 })
+        .map(|(&sq, &cnt)| {
+            if cnt > 0 {
+                (sq / cnt as f32).sqrt()
+            } else {
+                0.0
+            }
+        })
         .collect();
 
     tracing::info!(
@@ -2356,14 +2381,12 @@ fn find_candidate_triplets(
                 let k1 = &frames[1].keypoints[i1];
                 let k2 = &frames[2].keypoints[i2];
 
-                if let Some((disp_01, disp_12, cascade_err)) = config
-                    .verify_triplet_with_bounds(
-                        k0.point,
-                        k1.point,
-                        k2.point,
-                        Some(frames[0].image_size),
-                    )
-                {
+                if let Some((disp_01, disp_12, cascade_err)) = config.verify_triplet_with_bounds(
+                    k0.point,
+                    k1.point,
+                    k2.point,
+                    Some(frames[0].image_size),
+                ) {
                     let conf = (conf_01 * conf_12 * conf_02).cbrt();
                     verified_triplets.push(FeatureTriplet {
                         index_0: i0,
@@ -3110,10 +3133,7 @@ impl SuperPointDetector {
         sample_specs
     }
 
-    #[allow(
-        clippy::suboptimal_flops,
-        clippy::cast_precision_loss
-    )]
+    #[allow(clippy::suboptimal_flops, clippy::cast_precision_loss)]
     fn sample_and_normalize_descriptors(
         frame_descs: &TensorView<'_>,
         sample_specs: &[KeypointSampleSpec],
@@ -3235,11 +3255,7 @@ impl SuperPointDetector {
         scaled_size: Size2D<u32>,
         scale: f32,
     ) -> Vec<KeyPoint> {
-        let float_luma: Vec<f32> = img
-            .as_raw()
-            .iter()
-            .map(|&b| f32::from(b) / 255.0)
-            .collect();
+        let float_luma: Vec<f32> = img.as_raw().iter().map(|&b| f32::from(b) / 255.0).collect();
 
         let corner_scores = Self::compute_luma_corner_response(&float_luma, scaled_size);
 
@@ -3803,14 +3819,15 @@ impl ScaledLumaBuffer {
     )]
     fn from_luma_slice(luma: &[f32], size: Size2D<u32>) -> Self {
         let longest_side = size.width.max(size.height);
-        let (scale, scaled_width, scaled_height) = if longest_side > POINT_DETECTION_MAX_LONGEST_EDGE {
-            let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
-            let sw = (size.width as f32 * s).round() as u32;
-            let sh = (size.height as f32 * s).round() as u32;
-            (s, sw, sh)
-        } else {
-            (1.0, size.width, size.height)
-        };
+        let (scale, scaled_width, scaled_height) =
+            if longest_side > POINT_DETECTION_MAX_LONGEST_EDGE {
+                let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
+                let sw = (size.width as f32 * s).round() as u32;
+                let sh = (size.height as f32 * s).round() as u32;
+                (s, sw, sh)
+            } else {
+                (1.0, size.width, size.height)
+            };
 
         let raw_bytes: Vec<u8> = luma
             .iter()
@@ -3882,12 +3899,9 @@ impl PointDetector for SuperPointDetector {
         let orientation = StripOrientation::from_size(size).unwrap_or(StripOrientation::Horizontal);
         let delegator = orientation.delegator();
 
-        let mut keypoints = if let Some(kps) = self.try_infer_single_frame(
-            &prep.scaled_img,
-            prep.scaled_size,
-            prep.scale,
-            delegator,
-        ) {
+        let mut keypoints = if let Some(kps) =
+            self.try_infer_single_frame(&prep.scaled_img, prep.scaled_size, prep.scale, delegator)
+        {
             kps
         } else {
             self.detect_fallback_keypoints(&prep.scaled_img, prep.scaled_size, prep.scale)

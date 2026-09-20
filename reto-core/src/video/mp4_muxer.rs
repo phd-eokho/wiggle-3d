@@ -152,10 +152,7 @@ impl Mp4Muxer {
     ///
     /// # Errors
     /// Returns [`Error`] if required parameter sets are missing or writing fails.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_precision_loss
-    )]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     pub fn mux_hevc<W: Write>(
         width: u32,
         height: u32,
@@ -244,9 +241,7 @@ fn build_ftyp_box() -> Vec<u8> {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn build_mdat_and_sample_tables(
-    samples: &[EncodedVideoSample],
-) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
+fn build_mdat_and_sample_tables(samples: &[EncodedVideoSample]) -> (Vec<u8>, Vec<u32>, Vec<u32>) {
     let mut mdat_payload = Vec::new();
     let mut sample_sizes = Vec::with_capacity(samples.len());
     let mut sync_samples = Vec::new();

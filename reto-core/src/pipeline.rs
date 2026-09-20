@@ -885,9 +885,9 @@ pub fn process_single_image(
 ) -> Result<FrameRoiSet> {
     let item = ImageItemContext::new(file_path.to_path_buf(), output_dir.to_path_buf());
     let mut processed = process_item(item, config)?;
-    processed.take_rois().ok_or_else(|| {
-        Error::Unknown("Missing RoI results in processed context".to_string())
-    })
+    processed
+        .take_rois()
+        .ok_or_else(|| Error::Unknown("Missing RoI results in processed context".to_string()))
 }
 
 /// Drives processing for a verified batch of image files.
@@ -901,9 +901,12 @@ pub fn process_single_image(
 ///
 /// # Errors
 /// Returns [`Error::Io`] if output directory creation fails.
-type Stage1Result = std::result::Result<(usize, String, VisionStagePayload), (usize, String, Error)>;
-type Stage2Result = std::result::Result<(usize, String, AlignedStagePayload), (usize, String, Error)>;
-type Stage3Result = std::result::Result<(usize, String, EncodedStagePayload), (usize, String, Error)>;
+type Stage1Result =
+    std::result::Result<(usize, String, VisionStagePayload), (usize, String, Error)>;
+type Stage2Result =
+    std::result::Result<(usize, String, AlignedStagePayload), (usize, String, Error)>;
+type Stage3Result =
+    std::result::Result<(usize, String, EncodedStagePayload), (usize, String, Error)>;
 
 fn spawn_ingestion_stage(
     items: Vec<ImageItemContext>,
@@ -1156,8 +1159,9 @@ mod tests {
         // Video run: verify wiggle MP4 is saved and GIF is NOT saved when video config is enabled
         let video_output_path = temp_dir.join("video_output");
         let video_config = crate::video::WiggleVideoConfig::new().with_mock_fallback(true);
-        let request_video = BatchProcessingRequest::new(vec![input_path], video_output_path.clone(), false)
-            .with_video_config(Some(video_config));
+        let request_video =
+            BatchProcessingRequest::new(vec![input_path], video_output_path.clone(), false)
+                .with_video_config(Some(video_config));
         let summary_video = run_batch(&request_video).expect("Video batch should run");
         assert_eq!(summary_video.successful_count, 1);
         assert!(video_output_path.join("sample_strip_wiggle.mp4").exists());
