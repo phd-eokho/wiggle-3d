@@ -1145,7 +1145,7 @@ pub const MAX_CAMERA_ARRAY_VARS: usize = 32;
 ///
 /// Operates entirely on flat contiguous stack memory with zero dynamic heap allocations.
 #[inline]
-#[allow(clippy::needless_range_loop)]
+#[allow(clippy::needless_range_loop, clippy::suboptimal_flops)]
 fn solve_linear_system_stack(
     n: usize,
     a_flat: &[f32],
@@ -1195,6 +1195,9 @@ fn solve_linear_system_stack(
     for i in (0..n).rev() {
         let mut sum = b[i];
         for j in (i + 1)..n {
+            // Note (FMA vs Portability): Standard subtraction `sum -= a * x` is used for algorithmic
+            // readability and LLVM auto-vectorization. If explicit hardware FMA (`mul_add`) is adopted in
+            // future optimizations, ensure target architecture support (AVX2/NEON) to avoid libm `fmaf` emulation.
             sum -= a[i * n + j] * x[j];
         }
         x[i] = sum / a[i * n + i];
@@ -3143,7 +3146,8 @@ pub fn refine_keypoints_subpixel(
     clippy::suboptimal_flops,
     clippy::similar_names,
     clippy::suspicious_operation_groupings,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::manual_midpoint
 )]
 pub fn refine_keypoints_subpixel_with_drift(
     image: &image::GrayImage,
@@ -3267,6 +3271,10 @@ pub fn refine_keypoints_subpixel_with_drift(
 
             let trace_sq_minus_4det = (tr * tr - 4.0 * det).max(0.0);
             let sqrt_term = trace_sq_minus_4det.sqrt();
+            // Note (Eigenvalues vs Midpoint): Explicit `0.5 * (tr +- sqrt_term)` reflects the analytical
+            // quadratic 2x2 eigenvalue formula `(tr +- sqrt(tr^2 - 4*det)) / 2`. `f32::midpoint(tr, sqrt_term)`
+            // avoids intermediate overflow on huge floats, but normalized gradient traces here are strictly
+            // bounded (0.0..~10.0), making overflow impossible while preserving notation symmetry with `lambda_min`.
             let lambda_min = 0.5 * (tr - sqrt_term);
             let lambda_max = 0.5 * (tr + sqrt_term);
             let cond_ratio = if lambda_max > 1e-6 {
