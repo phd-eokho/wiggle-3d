@@ -1222,7 +1222,6 @@ impl HierarchicalReductionTree {
     #[allow(
         clippy::cast_precision_loss,
         clippy::similar_names,
-        clippy::too_many_lines,
         clippy::imprecise_flops
     )]
     pub fn build_from_match_sets(
@@ -1238,137 +1237,9 @@ impl HierarchicalReductionTree {
             };
         }
 
-        // Map pairwise matches by (min(a,b), max(a,b)) -> ((med_base, med_cross), count)
-        let mut obs_map: HashMap<(usize, usize), ((f32, f32), usize)> = HashMap::new();
-        for ms in match_sets {
-            let (f_a, f_b) = ms.pair;
-            if f_a >= n || f_b >= n || f_a == f_b {
-                continue;
-            }
-            let (src, dst) = if f_a < f_b { (f_a, f_b) } else { (f_b, f_a) };
-            let mut d_base = Vec::with_capacity(ms.matches.len());
-            let mut d_cross = Vec::with_capacity(ms.matches.len());
-
-            for m in &ms.matches {
-                let (idx_src, idx_dst) = if f_a < f_b {
-                    (m.index_a, m.index_b)
-                } else {
-                    (m.index_b, m.index_a)
-                };
-                if idx_src < frames[src].keypoints.len() && idx_dst < frames[dst].keypoints.len() {
-                    let ps = frames[src].keypoints[idx_src].point;
-                    let pd = frames[dst].keypoints[idx_dst].point;
-                    let (ps_b, ps_c, pd_b, pd_c) = match orientation {
-                        StripOrientation::Horizontal => (ps.x, ps.y, pd.x, pd.y),
-                        StripOrientation::Vertical => (ps.y, ps.x, pd.y, pd.x),
-                    };
-                    d_base.push(ps_b - pd_b);
-                    d_cross.push(pd_c - ps_c);
-                }
-            }
-
-            if !d_base.is_empty() {
-                let med_b = compute_median(&mut d_base);
-                let med_c = compute_median(&mut d_cross);
-                obs_map.insert((src, dst), ((med_b, med_c), d_base.len()));
-            }
-        }
-
-        // Generate dyadic spans across levels
-        let mut spans = Vec::new();
-        let mut stride = 1usize;
-        let mut level = 0usize;
-
-        while stride < n {
-            for i in 0..n {
-                let k = i + stride;
-                if k >= n {
-                    break;
-                }
-                let mid = i + stride / 2;
-                let (obs, count) = obs_map.get(&(i, k)).copied().unwrap_or(((0.0, 0.0), 0));
-                let status = if count > 0 {
-                    BranchStatus::Active
-                } else {
-                    BranchStatus::Synthesized
-                };
-                spans.push(DyadicSpan {
-                    start_frame: i,
-                    end_frame: k,
-                    mid_frame: mid,
-                    level,
-                    observed_translation: obs,
-                    composed_translation: (0.0, 0.0),
-                    chord_residual_px: 0.0,
-                    match_count: count,
-                    status,
-                });
-            }
-            stride *= 2;
-            level += 1;
-        }
-
-        // Ensure root span (0, n-1) is included
-        if n > 2
-            && !spans
-                .iter()
-                .any(|s| s.start_frame == 0 && s.end_frame == n - 1)
-        {
-            let mid = n / 2;
-            let (obs, count) = obs_map.get(&(0, n - 1)).copied().unwrap_or(((0.0, 0.0), 0));
-            let status = if count > 0 {
-                BranchStatus::Active
-            } else {
-                BranchStatus::Synthesized
-            };
-            spans.push(DyadicSpan {
-                start_frame: 0,
-                end_frame: n - 1,
-                mid_frame: mid,
-                level,
-                observed_translation: obs,
-                composed_translation: (0.0, 0.0),
-                chord_residual_px: 0.0,
-                match_count: count,
-                status,
-            });
-        }
-
-        // Compute bottom-up composed translations and chord residuals
-        let mut span_val_map: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
-        // First populate level 0 (leaves)
-        for s in &mut spans {
-            if s.level == 0 {
-                s.composed_translation = s.observed_translation;
-                span_val_map.insert((s.start_frame, s.end_frame), s.observed_translation);
-            }
-        }
-
-        // Then compute higher levels
-        for s in &mut spans {
-            if s.level > 0 {
-                let t_left = span_val_map
-                    .get(&(s.start_frame, s.mid_frame))
-                    .copied()
-                    .unwrap_or_default();
-                let t_right = span_val_map
-                    .get(&(s.mid_frame, s.end_frame))
-                    .copied()
-                    .unwrap_or_default();
-                let comp = (t_left.0 + t_right.0, t_left.1 + t_right.1);
-                s.composed_translation = comp;
-                span_val_map.insert((s.start_frame, s.end_frame), comp);
-
-                if s.match_count > 0 {
-                    let d0 = s.observed_translation.0 - comp.0;
-                    let d1 = s.observed_translation.1 - comp.1;
-                    s.chord_residual_px = d0.hypot(d1);
-                } else {
-                    s.observed_translation = comp;
-                    s.chord_residual_px = 0.0;
-                }
-            }
-        }
+        let obs_map = build_pairwise_observation_map(frames, match_sets, orientation);
+        let mut spans = generate_dyadic_spans(n, &obs_map);
+        compute_composed_translations(&mut spans);
 
         Self {
             num_frames: n,
@@ -1389,7 +1260,6 @@ impl HierarchicalReductionTree {
         clippy::cast_precision_loss,
         clippy::similar_names,
         clippy::suboptimal_flops,
-        clippy::too_many_lines,
         clippy::imprecise_flops
     )]
     pub fn optimize(
@@ -1411,373 +1281,624 @@ impl HierarchicalReductionTree {
             };
         }
 
-        // 1. Pre-optimization screening and branch pruning
-        let mut active_spans = self.spans.clone();
-        let mut pruned_branches_count = 0usize;
-        let mut max_level = 0usize;
+        let (active_spans, pruned_branches_count, max_level, rmse_before_px) =
+            screen_and_prune_branches(&self.spans, config.tolerance.max_branch_residual_px);
 
-        for s in &mut active_spans {
-            max_level = max_level.max(s.level);
-            if s.level > 0
-                && s.match_count > 0
-                && s.chord_residual_px > config.tolerance.max_branch_residual_px
-            {
-                s.status = BranchStatus::Pruned;
-                pruned_branches_count += 1;
-                tracing::warn!(
-                    span = ?(s.start_frame, s.end_frame),
-                    chord_residual_px = s.chord_residual_px,
-                    threshold_px = config.tolerance.max_branch_residual_px,
-                    "Pruned discordant hierarchical reduction tree branch to prevent optimization contamination"
-                );
-            }
-        }
+        let (initial_pos_x, initial_pos_y) = compute_initial_baseline_positions(n, &active_spans);
 
-        // Evaluate pre-optimization RMSE across non-leaf non-pruned dyadic spans
-        let mut pre_sq_err = 0.0_f32;
-        let mut pre_count = 0usize;
-        for s in &active_spans {
-            if s.level > 0 && s.match_count > 0 && s.status != BranchStatus::Pruned {
-                pre_sq_err += s.chord_residual_px * s.chord_residual_px;
-                pre_count += 1;
-            }
-        }
-        let rmse_before_px = if pre_count > 0 {
-            (pre_sq_err / pre_count as f32).sqrt()
-        } else {
-            0.0
-        };
+        let (pos_x_solved, pos_y_solved, solver_failed) = run_irls_iterations(
+            n,
+            initial_pos_x.clone(),
+            initial_pos_y.clone(),
+            &active_spans,
+            config,
+        );
 
-        // 2. Initialize safe baseline from adjacent level 0 leaves
-        let num_vars = n - 1;
-        let mut initial_pos_x = vec![0.0_f32; n];
-        let mut initial_pos_y = vec![0.0_f32; n];
+        let (fallback_triggered, fallback_reason) = check_optimization_fallback(
+            n,
+            &pos_x_solved,
+            &pos_y_solved,
+            &initial_pos_x,
+            solver_failed,
+            rmse_before_px,
+            &active_spans,
+            config,
+        );
 
-        for s in &active_spans {
-            if s.level == 0 && s.start_frame + 1 == s.end_frame {
-                initial_pos_x[s.end_frame] =
-                    initial_pos_x[s.start_frame] + s.observed_translation.0;
-                initial_pos_y[s.end_frame] =
-                    initial_pos_y[s.start_frame] + s.observed_translation.1;
-            }
-        }
-
-        let mut pos_x = initial_pos_x.clone();
-        let mut pos_y = initial_pos_y.clone();
-
-        let delta = config.huber_threshold_px.max(0.1);
-        let mut solver_failed = false;
-
-        // Run IRLS iterations
-        for _iter in 0..config.max_iterations {
-            let mut u_x = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
-            let mut u_y = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
-
-            for coord in 0..2 {
-                let mut h_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS * MAX_CAMERA_ARRAY_VARS];
-                let mut g_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
-
-                // Tikhonov damping for numerical stability
-                for i in 0..num_vars {
-                    h_flat[i * num_vars + i] += 1e-6;
-                }
-
-                // Accumulate direct observed constraints (skipping pruned branches)
-                for s in &active_spans {
-                    if s.match_count == 0 || s.status == BranchStatus::Pruned {
-                        continue;
-                    }
-                    let target = if coord == 0 {
-                        s.observed_translation.0
-                    } else {
-                        s.observed_translation.1
-                    };
-                    let cur_pred = if coord == 0 {
-                        pos_x[s.end_frame] - pos_x[s.start_frame]
-                    } else {
-                        pos_y[s.end_frame] - pos_y[s.start_frame]
-                    };
-                    let r = (cur_pred - target).abs();
-                    let huber_w = if r <= delta { 1.0 } else { delta / r };
-                    let w = (s.match_count as f32).sqrt() * huber_w;
-
-                    let idx_end = if s.end_frame > 0 {
-                        Some(s.end_frame - 1)
-                    } else {
-                        None
-                    };
-                    let idx_start = if s.start_frame > 0 {
-                        Some(s.start_frame - 1)
-                    } else {
-                        None
-                    };
-
-                    if let Some(ie) = idx_end {
-                        g_flat[ie] += w * target;
-                        h_flat[ie * num_vars + ie] += w;
-                    }
-                    if let Some(is) = idx_start {
-                        g_flat[is] -= w * target;
-                        h_flat[is * num_vars + is] += w;
-                    }
-                    if let (Some(ie), Some(is)) = (idx_end, idx_start) {
-                        h_flat[ie * num_vars + is] -= w;
-                        h_flat[is * num_vars + ie] -= w;
-                    }
-                }
-
-                // Accumulate hierarchical chord closure consistency constraints
-                if config.chord_consistency_weight > 0.0 {
-                    for s in &active_spans {
-                        if s.level == 0 || s.status == BranchStatus::Pruned {
-                            continue;
-                        }
-                        let target = if coord == 0 {
-                            s.composed_translation.0
-                        } else {
-                            s.composed_translation.1
-                        };
-                        let cur_pred = if coord == 0 {
-                            pos_x[s.end_frame] - pos_x[s.start_frame]
-                        } else {
-                            pos_y[s.end_frame] - pos_y[s.start_frame]
-                        };
-                        let r = (cur_pred - target).abs();
-                        let huber_w = if r <= delta { 1.0 } else { delta / r };
-                        let w = config.chord_consistency_weight * huber_w;
-
-                        let idx_end = if s.end_frame > 0 {
-                            Some(s.end_frame - 1)
-                        } else {
-                            None
-                        };
-                        let idx_start = if s.start_frame > 0 {
-                            Some(s.start_frame - 1)
-                        } else {
-                            None
-                        };
-
-                        if let Some(ie) = idx_end {
-                            g_flat[ie] += w * target;
-                            h_flat[ie * num_vars + ie] += w;
-                        }
-                        if let Some(is) = idx_start {
-                            g_flat[is] -= w * target;
-                            h_flat[is * num_vars + is] += w;
-                        }
-                        if let (Some(ie), Some(is)) = (idx_end, idx_start) {
-                            h_flat[ie * num_vars + is] -= w;
-                            h_flat[is * num_vars + ie] -= w;
-                        }
-                    }
-                }
-
-                if let Some(sol) = solve_linear_system_stack(
-                    num_vars,
-                    &h_flat[..num_vars * num_vars],
-                    &g_flat[..num_vars],
-                ) {
-                    if coord == 0 {
-                        u_x = sol;
-                    } else {
-                        u_y = sol;
-                    }
-                } else {
-                    solver_failed = true;
-                }
-            }
-
-            if solver_failed {
-                break;
-            }
-
-            // Update positions
-            let mut max_change = 0.0_f32;
-            for v in 1..n {
-                let dx = u_x[v - 1] - pos_x[v];
-                let dy = u_y[v - 1] - pos_y[v];
-                max_change = max_change.max(dx.abs().max(dy.abs()));
-                pos_x[v] = u_x[v - 1];
-                pos_y[v] = u_y[v - 1];
-            }
-
-            if max_change < config.convergence_epsilon {
-                break;
-            }
-        }
-
-        // 3. Post-solve verification and safe fallback sanity check
-        let mut fallback_triggered = false;
-        let mut fallback_reason = None;
-
-        if solver_failed {
-            fallback_triggered = true;
-            fallback_reason =
-                Some("Linear solver singularity / ill-conditioned matrix".to_string());
-        } else if pos_x.iter().any(|v| !v.is_finite()) || pos_y.iter().any(|v| !v.is_finite()) {
-            fallback_triggered = true;
-            fallback_reason =
-                Some("Non-finite camera positions detected after optimization".to_string());
-        } else if config.tolerance.enforce_monotonicity && n >= 2 {
-            // Check along-baseline monotonicity
-            let nominal_total = initial_pos_x[n - 1] - initial_pos_x[0];
-            if nominal_total.abs() > 1.0 {
-                let is_positive = nominal_total > 0.0;
-                for v in 0..n - 1 {
-                    let step = pos_x[v + 1] - pos_x[v];
-                    if (is_positive && step <= 0.0) || (!is_positive && step >= 0.0) {
-                        fallback_triggered = true;
-                        fallback_reason = Some(format!(
-                            "Monotonicity violation between Camera {} and {}: step={:.2}px",
-                            v,
-                            v + 1,
-                            step
-                        ));
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Compute preliminary RMSE to verify no severe degradation
-        let mut post_sq_err = 0.0_f32;
-        let mut post_count = 0usize;
-        for s in &active_spans {
-            if s.match_count > 0 && s.status != BranchStatus::Pruned {
-                let opt_dx = pos_x[s.end_frame] - pos_x[s.start_frame];
-                let opt_dy = pos_y[s.end_frame] - pos_y[s.start_frame];
-                let rx = s.observed_translation.0 - opt_dx;
-                let ry = s.observed_translation.1 - opt_dy;
-                let res = rx.hypot(ry);
-                post_sq_err += res * res;
-                post_count += 1;
-            }
-        }
-        let test_rmse_after = if post_count > 0 {
-            (post_sq_err / post_count as f32).sqrt()
-        } else {
-            0.0
-        };
-
-        if !fallback_triggered {
-            if test_rmse_after > config.tolerance.max_acceptable_rmse_px {
-                fallback_triggered = true;
-                fallback_reason = Some(format!(
-                    "Post-optimization RMSE {test_rmse_after:.2}px exceeded threshold {:.2}px",
-                    config.tolerance.max_acceptable_rmse_px
-                ));
-            } else if rmse_before_px > 1.0 && test_rmse_after > 1.5 * rmse_before_px {
-                fallback_triggered = true;
-                fallback_reason = Some(format!(
-                    "Optimization degraded residual error: {rmse_before_px:.2}px -> {test_rmse_after:.2}px"
-                ));
-            }
-        }
-
-        // Revert to initial safe positions if fallback was triggered
-        if fallback_triggered {
-            pos_x = initial_pos_x;
-            pos_y = initial_pos_y;
+        let (pos_x, pos_y) = if fallback_triggered {
             tracing::warn!(
                 reason = ?fallback_reason,
                 "Hierarchical extrinsic optimization triggered defensive fallback to nominal initial baseline"
             );
+            (initial_pos_x, initial_pos_y)
+        } else {
+            (pos_x_solved, pos_y_solved)
+        };
+
+        assemble_optimization_report(
+            n,
+            &pos_x,
+            &pos_y,
+            active_spans,
+            max_level,
+            pruned_branches_count,
+            rmse_before_px,
+            fallback_triggered,
+            fallback_reason,
+        )
+    }
+}
+
+type PairObservationMap = HashMap<(usize, usize), ((f32, f32), usize)>;
+
+#[allow(clippy::cast_precision_loss)]
+fn build_pairwise_observation_map(
+    frames: &[FeatureFrame],
+    match_sets: &[PairwiseMatchSet],
+    orientation: StripOrientation,
+) -> PairObservationMap {
+    let n = frames.len();
+    let mut obs_map = HashMap::new();
+    for ms in match_sets {
+        let (f_a, f_b) = ms.pair;
+        if f_a >= n || f_b >= n || f_a == f_b {
+            continue;
+        }
+        let (src, dst) = if f_a < f_b { (f_a, f_b) } else { (f_b, f_a) };
+        let mut d_base = Vec::with_capacity(ms.matches.len());
+        let mut d_cross = Vec::with_capacity(ms.matches.len());
+
+        for m in &ms.matches {
+            let (idx_src, idx_dst) = if f_a < f_b {
+                (m.index_a, m.index_b)
+            } else {
+                (m.index_b, m.index_a)
+            };
+            if idx_src < frames[src].keypoints.len() && idx_dst < frames[dst].keypoints.len() {
+                let ps = frames[src].keypoints[idx_src].point;
+                let pd = frames[dst].keypoints[idx_dst].point;
+                let (src_base, src_cross, dst_base, dst_cross) = match orientation {
+                    StripOrientation::Horizontal => (ps.x, ps.y, pd.x, pd.y),
+                    StripOrientation::Vertical => (ps.y, ps.x, pd.y, pd.x),
+                };
+                d_base.push(src_base - dst_base);
+                d_cross.push(dst_cross - src_cross);
+            }
         }
 
-        // 4. Final diagnostics calculation
-        let camera_positions: Vec<(f32, f32)> =
-            pos_x.iter().copied().zip(pos_y.iter().copied()).collect();
-
-        let mut adjacent_translations = Vec::with_capacity(n - 1);
-        for v in 0..n - 1 {
-            adjacent_translations.push((pos_x[v + 1] - pos_x[v], pos_y[v + 1] - pos_y[v]));
+        if !d_base.is_empty() {
+            let med_b = compute_median(&mut d_base);
+            let med_c = compute_median(&mut d_cross);
+            obs_map.insert((src, dst), ((med_b, med_c), d_base.len()));
         }
+    }
+    obs_map
+}
 
-        let chord_dy = pos_y[n - 1] - pos_y[0];
-        let mut center_sags_px = Vec::with_capacity(n.saturating_sub(2));
-        for v in 1..n - 1 {
-            let frac = v as f32 / (n - 1) as f32;
-            let expected_y = pos_y[0] + frac * chord_dy;
-            center_sags_px.push(pos_y[v] - expected_y);
+fn generate_dyadic_spans(n: usize, obs_map: &PairObservationMap) -> Vec<DyadicSpan> {
+    let mut spans = Vec::new();
+    let mut stride = 1usize;
+    let mut level = 0usize;
+
+    while stride < n {
+        for i in 0..n {
+            let k = i + stride;
+            if k >= n {
+                break;
+            }
+            let mid = i + stride / 2;
+            let (obs, count) = obs_map.get(&(i, k)).copied().unwrap_or(((0.0, 0.0), 0));
+            let status = if count > 0 {
+                BranchStatus::Active
+            } else {
+                BranchStatus::Synthesized
+            };
+            spans.push(DyadicSpan {
+                start_frame: i,
+                end_frame: k,
+                mid_frame: mid,
+                level,
+                observed_translation: obs,
+                composed_translation: (0.0, 0.0),
+                chord_residual_px: 0.0,
+                match_count: count,
+                status,
+            });
         }
+        stride *= 2;
+        level += 1;
+    }
 
-        let mut final_spans = active_spans;
-        let mut final_sq_err = 0.0_f32;
-        let mut final_count = 0usize;
-        let mut level_sq = vec![0.0_f32; max_level + 1];
-        let mut level_cnt = vec![0usize; max_level + 1];
+    if n > 2
+        && !spans
+            .iter()
+            .any(|s| s.start_frame == 0 && s.end_frame == n - 1)
+    {
+        let mid = n / 2;
+        let (obs, count) = obs_map.get(&(0, n - 1)).copied().unwrap_or(((0.0, 0.0), 0));
+        let status = if count > 0 {
+            BranchStatus::Active
+        } else {
+            BranchStatus::Synthesized
+        };
+        spans.push(DyadicSpan {
+            start_frame: 0,
+            end_frame: n - 1,
+            mid_frame: mid,
+            level,
+            observed_translation: obs,
+            composed_translation: (0.0, 0.0),
+            chord_residual_px: 0.0,
+            match_count: count,
+            status,
+        });
+    }
 
-        for s in &mut final_spans {
-            let opt_dx = pos_x[s.end_frame] - pos_x[s.start_frame];
-            let opt_dy = pos_y[s.end_frame] - pos_y[s.start_frame];
-            s.composed_translation = (opt_dx, opt_dy);
+    spans
+}
+
+fn compute_composed_translations(spans: &mut [DyadicSpan]) {
+    let mut span_val_map: HashMap<(usize, usize), (f32, f32)> = HashMap::new();
+    for s in spans.iter_mut() {
+        if s.level == 0 {
+            s.composed_translation = s.observed_translation;
+            span_val_map.insert((s.start_frame, s.end_frame), s.observed_translation);
+        }
+    }
+
+    for s in spans.iter_mut() {
+        if s.level > 0 {
+            let t_left = span_val_map
+                .get(&(s.start_frame, s.mid_frame))
+                .copied()
+                .unwrap_or_default();
+            let t_right = span_val_map
+                .get(&(s.mid_frame, s.end_frame))
+                .copied()
+                .unwrap_or_default();
+            let comp = (t_left.0 + t_right.0, t_left.1 + t_right.1);
+            s.composed_translation = comp;
+            span_val_map.insert((s.start_frame, s.end_frame), comp);
 
             if s.match_count > 0 {
-                let rx = s.observed_translation.0 - opt_dx;
-                let ry = s.observed_translation.1 - opt_dy;
-                let res = rx.hypot(ry);
-                s.chord_residual_px = res;
-
-                if s.status != BranchStatus::Pruned {
-                    final_sq_err += res * res;
-                    final_count += 1;
-
-                    if s.level <= max_level {
-                        level_sq[s.level] += res * res;
-                        level_cnt[s.level] += 1;
-                    }
-                }
+                let d0 = s.observed_translation.0 - comp.0;
+                let d1 = s.observed_translation.1 - comp.1;
+                s.chord_residual_px = d0.hypot(d1);
+            } else {
+                s.observed_translation = comp;
+                s.chord_residual_px = 0.0;
             }
         }
+    }
+}
 
-        let rmse_after_px = if final_count > 0 {
-            (final_sq_err / final_count as f32).sqrt()
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+fn screen_and_prune_branches(
+    spans: &[DyadicSpan],
+    max_branch_residual_px: f32,
+) -> (Vec<DyadicSpan>, usize, usize, f32) {
+    let mut active_spans = spans.to_vec();
+    let mut pruned_branches_count = 0usize;
+    let mut max_level = 0usize;
+
+    for s in &mut active_spans {
+        max_level = max_level.max(s.level);
+        if s.level > 0 && s.match_count > 0 && s.chord_residual_px > max_branch_residual_px {
+            s.status = BranchStatus::Pruned;
+            pruned_branches_count += 1;
+            tracing::warn!(
+                span = ?(s.start_frame, s.end_frame),
+                chord_residual_px = s.chord_residual_px,
+                threshold_px = max_branch_residual_px,
+                "Pruned discordant hierarchical reduction tree branch to prevent optimization contamination"
+            );
+        }
+    }
+
+    let mut pre_sq_err = 0.0_f32;
+    let mut pre_count = 0usize;
+    for s in &active_spans {
+        if s.level > 0 && s.match_count > 0 && s.status != BranchStatus::Pruned {
+            pre_sq_err += s.chord_residual_px * s.chord_residual_px;
+            pre_count += 1;
+        }
+    }
+    let rmse_before_px = if pre_count > 0 {
+        (pre_sq_err / pre_count as f32).sqrt()
+    } else {
+        0.0
+    };
+
+    (
+        active_spans,
+        pruned_branches_count,
+        max_level,
+        rmse_before_px,
+    )
+}
+
+fn compute_initial_baseline_positions(n: usize, spans: &[DyadicSpan]) -> (Vec<f32>, Vec<f32>) {
+    let mut initial_pos_x = vec![0.0_f32; n];
+    let mut initial_pos_y = vec![0.0_f32; n];
+
+    for s in spans {
+        if s.level == 0 && s.start_frame + 1 == s.end_frame {
+            initial_pos_x[s.end_frame] = initial_pos_x[s.start_frame] + s.observed_translation.0;
+            initial_pos_y[s.end_frame] = initial_pos_y[s.start_frame] + s.observed_translation.1;
+        }
+    }
+    (initial_pos_x, initial_pos_y)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::too_many_arguments
+)]
+fn accumulate_irls_constraints(
+    num_vars: usize,
+    coord: usize,
+    pos_x: &[f32],
+    pos_y: &[f32],
+    active_spans: &[DyadicSpan],
+    config: &HierarchicalExtrinsicsConfig,
+    delta: f32,
+    h_flat: &mut [f32],
+    g_flat: &mut [f32],
+) {
+    for i in 0..num_vars {
+        h_flat[i * num_vars + i] += 1e-6;
+    }
+
+    for s in active_spans {
+        if s.match_count == 0 || s.status == BranchStatus::Pruned {
+            continue;
+        }
+        let target = if coord == 0 {
+            s.observed_translation.0
         } else {
-            0.0
+            s.observed_translation.1
+        };
+        let cur_pred = if coord == 0 {
+            pos_x[s.end_frame] - pos_x[s.start_frame]
+        } else {
+            pos_y[s.end_frame] - pos_y[s.start_frame]
+        };
+        let r = (cur_pred - target).abs();
+        let huber_w = if r <= delta { 1.0 } else { delta / r };
+        let w = (s.match_count as f32).sqrt() * huber_w;
+
+        let idx_end = if s.end_frame > 0 {
+            Some(s.end_frame - 1)
+        } else {
+            None
+        };
+        let idx_start = if s.start_frame > 0 {
+            Some(s.start_frame - 1)
+        } else {
+            None
         };
 
-        let rmse_px = RmseMetric::new(rmse_before_px, rmse_after_px);
-        let fallback = if fallback_triggered {
-            FallbackStatus::Triggered {
-                reason: fallback_reason.unwrap_or_else(|| "Unknown fallback condition".to_string()),
+        if let Some(ie) = idx_end {
+            g_flat[ie] += w * target;
+            h_flat[ie * num_vars + ie] += w;
+        }
+        if let Some(is) = idx_start {
+            g_flat[is] -= w * target;
+            h_flat[is * num_vars + is] += w;
+        }
+        if let (Some(ie), Some(is)) = (idx_end, idx_start) {
+            h_flat[ie * num_vars + is] -= w;
+            h_flat[is * num_vars + ie] -= w;
+        }
+    }
+
+    if config.chord_consistency_weight > 0.0 {
+        for s in active_spans {
+            if s.level == 0 || s.status == BranchStatus::Pruned {
+                continue;
             }
-        } else {
-            FallbackStatus::None
-        };
+            let target = if coord == 0 {
+                s.composed_translation.0
+            } else {
+                s.composed_translation.1
+            };
+            let cur_pred = if coord == 0 {
+                pos_x[s.end_frame] - pos_x[s.start_frame]
+            } else {
+                pos_y[s.end_frame] - pos_y[s.start_frame]
+            };
+            let r = (cur_pred - target).abs();
+            let huber_w = if r <= delta { 1.0 } else { delta / r };
+            let w = config.chord_consistency_weight * huber_w;
 
-        let level_rmse_px: Vec<f32> = level_sq
-            .iter()
-            .zip(level_cnt.iter())
-            .map(|(&sq, &cnt)| {
-                if cnt > 0 {
-                    (sq / cnt as f32).sqrt()
+            let idx_end = if s.end_frame > 0 {
+                Some(s.end_frame - 1)
+            } else {
+                None
+            };
+            let idx_start = if s.start_frame > 0 {
+                Some(s.start_frame - 1)
+            } else {
+                None
+            };
+
+            if let Some(ie) = idx_end {
+                g_flat[ie] += w * target;
+                h_flat[ie * num_vars + ie] += w;
+            }
+            if let Some(is) = idx_start {
+                g_flat[is] -= w * target;
+                h_flat[is * num_vars + is] += w;
+            }
+            if let (Some(ie), Some(is)) = (idx_end, idx_start) {
+                h_flat[ie * num_vars + is] -= w;
+                h_flat[is * num_vars + ie] -= w;
+            }
+        }
+    }
+}
+
+fn run_irls_iterations(
+    n: usize,
+    mut pos_x: Vec<f32>,
+    mut pos_y: Vec<f32>,
+    active_spans: &[DyadicSpan],
+    config: &HierarchicalExtrinsicsConfig,
+) -> (Vec<f32>, Vec<f32>, bool) {
+    let num_vars = n - 1;
+    let delta = config.huber_threshold_px.max(0.1);
+    let mut solver_failed = false;
+
+    for _iter in 0..config.max_iterations {
+        let mut u_x = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+        let mut u_y = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+
+        for coord in 0..2 {
+            let mut h_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS * MAX_CAMERA_ARRAY_VARS];
+            let mut g_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+
+            accumulate_irls_constraints(
+                num_vars,
+                coord,
+                &pos_x,
+                &pos_y,
+                active_spans,
+                config,
+                delta,
+                &mut h_flat,
+                &mut g_flat,
+            );
+
+            if let Some(sol) = solve_linear_system_stack(
+                num_vars,
+                &h_flat[..num_vars * num_vars],
+                &g_flat[..num_vars],
+            ) {
+                if coord == 0 {
+                    u_x = sol;
                 } else {
-                    0.0
+                    u_y = sol;
                 }
-            })
-            .collect();
-
-        tracing::info!(
-            num_cameras = n,
-            rmse_before_px = rmse_px.before,
-            rmse_after_px = rmse_px.after,
-            relative_improvement_pct = rmse_px.improvement_pct,
-            fallback_triggered = fallback.is_triggered(),
-            pruned_branches = pruned_branches_count,
-            "Hierarchical camera array extrinsic optimization completed"
-        );
-
-        HierarchicalOptimizationReport {
-            num_cameras: n,
-            rmse_px,
-            camera_positions,
-            adjacent_translations,
-            center_sags_px,
-            level_rmse_px,
-            dyadic_spans: final_spans,
-            fallback,
-            pruned_branches: pruned_branches_count,
+            } else {
+                solver_failed = true;
+            }
         }
+
+        if solver_failed {
+            break;
+        }
+
+        let mut max_change = 0.0_f32;
+        for v in 1..n {
+            let dx = u_x[v - 1] - pos_x[v];
+            let dy = u_y[v - 1] - pos_y[v];
+            max_change = max_change.max(dx.abs().max(dy.abs()));
+            pos_x[v] = u_x[v - 1];
+            pos_y[v] = u_y[v - 1];
+        }
+
+        if max_change < config.convergence_epsilon {
+            break;
+        }
+    }
+
+    (pos_x, pos_y, solver_failed)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops
+)]
+fn check_optimization_fallback(
+    n: usize,
+    pos_x: &[f32],
+    pos_y: &[f32],
+    initial_pos_x: &[f32],
+    solver_failed: bool,
+    rmse_before_px: f32,
+    active_spans: &[DyadicSpan],
+    config: &HierarchicalExtrinsicsConfig,
+) -> (bool, Option<String>) {
+    if solver_failed {
+        return (
+            true,
+            Some("Linear solver singularity / ill-conditioned matrix".to_string()),
+        );
+    }
+    if pos_x.iter().any(|v| !v.is_finite()) || pos_y.iter().any(|v| !v.is_finite()) {
+        return (
+            true,
+            Some("Non-finite camera positions detected after optimization".to_string()),
+        );
+    }
+    if config.tolerance.enforce_monotonicity && n >= 2 {
+        let nominal_total = initial_pos_x[n - 1] - initial_pos_x[0];
+        if nominal_total.abs() > 1.0 {
+            let is_positive = nominal_total > 0.0;
+            for v in 0..n - 1 {
+                let step = pos_x[v + 1] - pos_x[v];
+                if (is_positive && step <= 0.0) || (!is_positive && step >= 0.0) {
+                    return (
+                        true,
+                        Some(format!(
+                            "Monotonicity violation between Camera {} and {}: step={:.2}px",
+                            v,
+                            v + 1,
+                            step
+                        )),
+                    );
+                }
+            }
+        }
+    }
+
+    let mut post_sq_err = 0.0_f32;
+    let mut post_count = 0usize;
+    for s in active_spans {
+        if s.match_count > 0 && s.status != BranchStatus::Pruned {
+            let diff_x = pos_x[s.end_frame] - pos_x[s.start_frame];
+            let diff_y = pos_y[s.end_frame] - pos_y[s.start_frame];
+            let res = (s.observed_translation.0 - diff_x).hypot(s.observed_translation.1 - diff_y);
+            post_sq_err += res * res;
+            post_count += 1;
+        }
+    }
+    let test_rmse_after = if post_count > 0 {
+        (post_sq_err / post_count as f32).sqrt()
+    } else {
+        0.0
+    };
+
+    if test_rmse_after > config.tolerance.max_acceptable_rmse_px {
+        return (
+            true,
+            Some(format!(
+                "Post-optimization RMSE {test_rmse_after:.2}px exceeded threshold {:.2}px",
+                config.tolerance.max_acceptable_rmse_px
+            )),
+        );
+    }
+    if rmse_before_px > 1.0 && test_rmse_after > 1.5 * rmse_before_px {
+        return (
+            true,
+            Some(format!(
+                "Optimization degraded residual error: {rmse_before_px:.2}px -> {test_rmse_after:.2}px"
+            )),
+        );
+    }
+
+    (false, None)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::similar_names,
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops
+)]
+fn assemble_optimization_report(
+    n: usize,
+    pos_x: &[f32],
+    pos_y: &[f32],
+    mut active_spans: Vec<DyadicSpan>,
+    max_level: usize,
+    pruned_branches_count: usize,
+    rmse_before_px: f32,
+    fallback_triggered: bool,
+    fallback_reason: Option<String>,
+) -> HierarchicalOptimizationReport {
+    let camera_positions: Vec<(f32, f32)> =
+        pos_x.iter().copied().zip(pos_y.iter().copied()).collect();
+
+    let mut adjacent_translations = Vec::with_capacity(n - 1);
+    for v in 0..n - 1 {
+        adjacent_translations.push((pos_x[v + 1] - pos_x[v], pos_y[v + 1] - pos_y[v]));
+    }
+
+    let chord_dy = pos_y[n - 1] - pos_y[0];
+    let mut center_sags_px = Vec::with_capacity(n.saturating_sub(2));
+    for v in 1..n - 1 {
+        let frac = v as f32 / (n - 1) as f32;
+        let expected_y = pos_y[0] + frac * chord_dy;
+        center_sags_px.push(pos_y[v] - expected_y);
+    }
+
+    let mut final_sq_err = 0.0_f32;
+    let mut final_count = 0usize;
+    let mut level_sq = vec![0.0_f32; max_level + 1];
+    let mut level_cnt = vec![0usize; max_level + 1];
+
+    for s in &mut active_spans {
+        let diff_x = pos_x[s.end_frame] - pos_x[s.start_frame];
+        let diff_y = pos_y[s.end_frame] - pos_y[s.start_frame];
+        s.composed_translation = (diff_x, diff_y);
+
+        if s.match_count > 0 {
+            let res = (s.observed_translation.0 - diff_x).hypot(s.observed_translation.1 - diff_y);
+            s.chord_residual_px = res;
+
+            if s.status != BranchStatus::Pruned {
+                final_sq_err += res * res;
+                final_count += 1;
+
+                if s.level <= max_level {
+                    level_sq[s.level] += res * res;
+                    level_cnt[s.level] += 1;
+                }
+            }
+        }
+    }
+
+    let rmse_after_px = if final_count > 0 {
+        (final_sq_err / final_count as f32).sqrt()
+    } else {
+        0.0
+    };
+
+    let rmse_px = RmseMetric::new(rmse_before_px, rmse_after_px);
+    let fallback = if fallback_triggered {
+        FallbackStatus::Triggered {
+            reason: fallback_reason.unwrap_or_else(|| "Unknown fallback condition".to_string()),
+        }
+    } else {
+        FallbackStatus::None
+    };
+
+    let level_rmse_px: Vec<f32> = level_sq
+        .iter()
+        .zip(level_cnt.iter())
+        .map(|(&sq, &cnt)| {
+            if cnt > 0 {
+                (sq / cnt as f32).sqrt()
+            } else {
+                0.0
+            }
+        })
+        .collect();
+
+    tracing::info!(
+        num_cameras = n,
+        rmse_before_px = rmse_px.before,
+        rmse_after_px = rmse_px.after,
+        relative_improvement_pct = rmse_px.improvement_pct,
+        fallback_triggered = fallback.is_triggered(),
+        pruned_branches = pruned_branches_count,
+        "Hierarchical camera array extrinsic optimization completed"
+    );
+
+    HierarchicalOptimizationReport {
+        num_cameras: n,
+        rmse_px,
+        camera_positions,
+        adjacent_translations,
+        center_sags_px,
+        level_rmse_px,
+        dyadic_spans: active_spans,
+        fallback,
+        pruned_branches: pruned_branches_count,
     }
 }
 
@@ -2117,7 +2238,6 @@ pub trait FeatureMatcher: Send + Sync {
     ///
     /// # Errors
     /// Returns [`AlignmentError`] if frames count is less than 3 or pairwise matching fails.
-    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn extract_consistent_triplets(
         &self,
         frames: &[FeatureFrame],
@@ -2145,60 +2265,8 @@ pub trait FeatureMatcher: Send + Sync {
             t.on_matches_found(m02.pair, &m02.matches);
         }
 
-        // Build adjacency map from 0 -> 1
-        let mut map_01: HashMap<usize, (usize, f32)> = HashMap::with_capacity(m01.len());
-        for m in &m01.matches {
-            map_01.insert(m.index_a, (m.index_b, m.confidence));
-        }
-
-        // Build adjacency map from 1 -> 2
-        let mut map_12: HashMap<usize, (usize, f32)> = HashMap::with_capacity(m12.len());
-        for m in &m12.matches {
-            map_12.insert(m.index_a, (m.index_b, m.confidence));
-        }
-
-        // Build lookup set for 0 -> 2 cycle closure
-        let mut map_02: HashMap<(usize, usize), f32> = HashMap::with_capacity(m02.len());
-        for m in &m02.matches {
-            map_02.insert((m.index_a, m.index_b), m.confidence);
-        }
-
-        let mut verified_triplets = Vec::new();
-        let mut cycle_candidates = 0usize;
-
-        for (&i0, &(i1, conf_01)) in &map_01 {
-            if let Some(&(i2, conf_12)) = map_12.get(&i1) {
-                // Check cycle closure in 0-2 baseline
-                if let Some(&conf_02) = map_02.get(&(i0, i2)) {
-                    cycle_candidates += 1;
-                    // Extract physical coordinates
-                    let k0 = &frames[0].keypoints[i0];
-                    let k1 = &frames[1].keypoints[i1];
-                    let k2 = &frames[2].keypoints[i2];
-
-                    if let Some((disp_01, disp_12, cascade_err)) = config
-                        .verify_triplet_with_bounds(
-                            k0.point,
-                            k1.point,
-                            k2.point,
-                            Some(frames[0].image_size),
-                        )
-                    {
-                        // Geometric mean of 3-way matching confidence
-                        let conf = (conf_01 * conf_12 * conf_02).cbrt();
-                        verified_triplets.push(FeatureTriplet {
-                            index_0: i0,
-                            index_1: i1,
-                            index_2: i2,
-                            confidence: conf,
-                            disparity_01: disp_01,
-                            disparity_12: disp_12,
-                            cascade_error: cascade_err,
-                        });
-                    }
-                }
-            }
-        }
+        let (mut verified_triplets, cycle_candidates) =
+            find_candidate_triplets(frames, &m01, &m12, &m02, config);
 
         tracing::info!(
             cycle_candidates,
@@ -2206,39 +2274,8 @@ pub trait FeatureMatcher: Send + Sync {
             "Candidate triplets evaluated"
         );
 
-        if tracing::enabled!(tracing::Level::DEBUG) && !verified_triplets.is_empty() {
-            let n = verified_triplets.len() as f32;
-            let sum_sq_cascade: f32 = verified_triplets
-                .iter()
-                .map(|t| t.cascade_error * t.cascade_error)
-                .sum();
-            let rmse_cascade_err = (sum_sq_cascade / n).sqrt();
-            let max_cascade_err: f32 = verified_triplets
-                .iter()
-                .map(|t| t.cascade_error)
-                .fold(0.0_f32, f32::max);
-            let mean_disparity: f32 = verified_triplets
-                .iter()
-                .map(|t| f32::midpoint(t.disparity_01, t.disparity_12))
-                .sum::<f32>()
-                / n;
-            let relative_extrinsic_loss_pct = if mean_disparity > 1e-4 {
-                (rmse_cascade_err / mean_disparity) * 100.0
-            } else {
-                0.0
-            };
+        log_triplet_diagnostics(&verified_triplets);
 
-            tracing::debug!(
-                verified_triplets = verified_triplets.len(),
-                rmse_cascade_error_px = rmse_cascade_err,
-                max_cascade_error_px = max_cascade_err,
-                mean_disparity_px = mean_disparity,
-                relative_extrinsic_loss_pct,
-                "Extrinsic parameter consistency & parallax-aware reprojection loss"
-            );
-        }
-
-        // Sort triplets by confidence descending
         verified_triplets.sort_unstable_by(|a, b| {
             b.confidence
                 .partial_cmp(&a.confidence)
@@ -2313,6 +2350,98 @@ pub trait FeatureMatcher: Send + Sync {
     }
 }
 
+fn find_candidate_triplets(
+    frames: &[FeatureFrame],
+    m01: &PairwiseMatchSet,
+    m12: &PairwiseMatchSet,
+    m02: &PairwiseMatchSet,
+    config: &TripletConsistencyConfig,
+) -> (Vec<FeatureTriplet>, usize) {
+    let mut map_01 = HashMap::with_capacity(m01.len());
+    for m in &m01.matches {
+        map_01.insert(m.index_a, (m.index_b, m.confidence));
+    }
+
+    let mut map_12 = HashMap::with_capacity(m12.len());
+    for m in &m12.matches {
+        map_12.insert(m.index_a, (m.index_b, m.confidence));
+    }
+
+    let mut map_02 = HashMap::with_capacity(m02.len());
+    for m in &m02.matches {
+        map_02.insert((m.index_a, m.index_b), m.confidence);
+    }
+
+    let mut verified_triplets = Vec::new();
+    let mut cycle_candidates = 0usize;
+
+    for (&i0, &(i1, conf_01)) in &map_01 {
+        if let Some(&(i2, conf_12)) = map_12.get(&i1) {
+            if let Some(&conf_02) = map_02.get(&(i0, i2)) {
+                cycle_candidates += 1;
+                let k0 = &frames[0].keypoints[i0];
+                let k1 = &frames[1].keypoints[i1];
+                let k2 = &frames[2].keypoints[i2];
+
+                if let Some((disp_01, disp_12, cascade_err)) = config.verify_triplet_with_bounds(
+                    k0.point,
+                    k1.point,
+                    k2.point,
+                    Some(frames[0].image_size),
+                ) {
+                    let conf = (conf_01 * conf_12 * conf_02).cbrt();
+                    verified_triplets.push(FeatureTriplet {
+                        index_0: i0,
+                        index_1: i1,
+                        index_2: i2,
+                        confidence: conf,
+                        disparity_01: disp_01,
+                        disparity_12: disp_12,
+                        cascade_error: cascade_err,
+                    });
+                }
+            }
+        }
+    }
+
+    (verified_triplets, cycle_candidates)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn log_triplet_diagnostics(verified_triplets: &[FeatureTriplet]) {
+    if tracing::enabled!(tracing::Level::DEBUG) && !verified_triplets.is_empty() {
+        let n = verified_triplets.len() as f32;
+        let sum_sq_cascade: f32 = verified_triplets
+            .iter()
+            .map(|t| t.cascade_error * t.cascade_error)
+            .sum();
+        let rmse_cascade_err = (sum_sq_cascade / n).sqrt();
+        let max_cascade_err: f32 = verified_triplets
+            .iter()
+            .map(|t| t.cascade_error)
+            .fold(0.0_f32, f32::max);
+        let mean_disparity: f32 = verified_triplets
+            .iter()
+            .map(|t| f32::midpoint(t.disparity_01, t.disparity_12))
+            .sum::<f32>()
+            / n;
+        let relative_extrinsic_loss_pct = if mean_disparity > 1e-4 {
+            (rmse_cascade_err / mean_disparity) * 100.0
+        } else {
+            0.0
+        };
+
+        tracing::debug!(
+            verified_triplets = verified_triplets.len(),
+            rmse_cascade_error_px = rmse_cascade_err,
+            max_cascade_error_px = max_cascade_err,
+            mean_disparity_px = mean_disparity,
+            relative_extrinsic_loss_pct,
+            "Extrinsic parameter consistency & parallax-aware reprojection loss"
+        );
+    }
+}
+
 /// Baseline descriptor matcher for `SuperPoint` features using nearest-neighbor dot products.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SuperPointDescriptorMatcher {
@@ -2343,14 +2472,58 @@ impl SuperPointDescriptorMatcher {
     }
 }
 
+#[inline]
+fn find_best_match_for_descriptor(
+    desc_a: &[f32],
+    desc_matrix_b: &[f32],
+    valid_indices_b: &[usize],
+    min_similarity: f32,
+    ratio_threshold: f32,
+) -> Option<(usize, MatchScore)> {
+    const DIM: usize = 256;
+    let mut best_sim = -1.0_f32;
+    let mut second_best_sim = -1.0_f32;
+    let mut best_idx = 0;
+
+    for (k, &idx_b) in valid_indices_b.iter().enumerate() {
+        let desc_b_slice = &desc_matrix_b[k * DIM..(k + 1) * DIM];
+        let sim = compute_dot_product_256(desc_a, desc_b_slice);
+
+        if sim > best_sim {
+            second_best_sim = best_sim;
+            best_sim = sim;
+            best_idx = idx_b;
+        } else if sim > second_best_sim {
+            second_best_sim = sim;
+        }
+    }
+
+    let passes_ratio = if second_best_sim > 0.0 {
+        let dist_best = 1.0 - best_sim;
+        let dist_second = 1.0 - second_best_sim;
+        dist_best <= ratio_threshold * dist_second
+    } else {
+        true
+    };
+
+    if best_sim >= min_similarity && passes_ratio {
+        let dist_ratio = if second_best_sim > 0.0 && (1.0 - second_best_sim).abs() > 1e-6 {
+            Some((1.0 - best_sim) / (1.0 - second_best_sim))
+        } else {
+            None
+        };
+        Some((best_idx, MatchScore::new(best_sim, best_sim, dist_ratio)))
+    } else {
+        None
+    }
+}
+
 impl FeatureMatcher for SuperPointDescriptorMatcher {
     fn match_pair(
         &self,
         frame_a: &FeatureFrame,
         frame_b: &FeatureFrame,
     ) -> AlignmentResult<PairwiseMatchSet> {
-        let mut matches = Vec::new();
-
         let (mut valid_indices_b, mut desc_matrix_b) = (Vec::new(), Vec::new());
         for (i_b, kp_b) in frame_b.keypoints.iter().enumerate() {
             if let Some(ref desc_b) = kp_b.descriptor {
@@ -2362,53 +2535,23 @@ impl FeatureMatcher for SuperPointDescriptorMatcher {
         if valid_indices_b.is_empty() {
             return Ok(PairwiseMatchSet::new(
                 (frame_a.frame_index, frame_b.frame_index),
-                matches,
+                Vec::new(),
                 MatchDirection::Forward,
             ));
         }
 
-        let num_b = valid_indices_b.len();
-        let dim = 256;
-
+        let mut matches = Vec::new();
         for (i_a, kp_a) in frame_a.keypoints.iter().enumerate() {
-            let Some(ref desc_a) = kp_a.descriptor else {
-                continue;
-            };
-
-            let mut best_sim = -1.0_f32;
-            let mut second_best_sim = -1.0_f32;
-            let mut best_idx = 0;
-
-            for k in 0..num_b {
-                let desc_b_slice = &desc_matrix_b[k * dim..(k + 1) * dim];
-                let sim = compute_dot_product_256(desc_a, desc_b_slice);
-
-                if sim > best_sim {
-                    second_best_sim = best_sim;
-                    best_sim = sim;
-                    best_idx = valid_indices_b[k];
-                } else if sim > second_best_sim {
-                    second_best_sim = sim;
+            if let Some(ref desc_a) = kp_a.descriptor {
+                if let Some((best_idx, score)) = find_best_match_for_descriptor(
+                    desc_a,
+                    &desc_matrix_b,
+                    &valid_indices_b,
+                    self.min_similarity,
+                    self.ratio_threshold,
+                ) {
+                    matches.push(FeatureMatch::with_score(i_a, best_idx, score));
                 }
-            }
-
-            // Lowe's ratio test check (distance ratio -> similarity ratio inverse)
-            let passes_ratio = if second_best_sim > 0.0 {
-                let dist_best = 1.0 - best_sim;
-                let dist_second = 1.0 - second_best_sim;
-                dist_best <= self.ratio_threshold * dist_second
-            } else {
-                true
-            };
-
-            if best_sim >= self.min_similarity && passes_ratio {
-                let dist_ratio = if second_best_sim > 0.0 && (1.0 - second_best_sim).abs() > 1e-6 {
-                    Some((1.0 - best_sim) / (1.0 - second_best_sim))
-                } else {
-                    None
-                };
-                let score = MatchScore::new(best_sim, best_sim, dist_ratio);
-                matches.push(FeatureMatch::with_score(i_a, best_idx, score));
             }
         }
 
@@ -2875,58 +3018,18 @@ impl SuperPointDetector {
         response
     }
 
-    /// Decodes raw `SuperPoint` ONNX tensor outputs using batch candidate filtering,
-    /// linear-time $\mathcal{O}(N)$ top-K selection, and contiguous SIMD descriptor interpolation.
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::too_many_lines,
-        clippy::suboptimal_flops,
-        clippy::similar_names,
-        clippy::needless_pass_by_value
-    )]
-    fn decode_superpoint_vectorized(
-        kpts: TensorView<'_>,
-        scs: TensorView<'_>,
-        descs: TensorView<'_>,
+    #[allow(clippy::cast_precision_loss, clippy::similar_names)]
+    fn filter_superpoint_candidates(
+        frame_kpts: &TensorView<'_>,
+        frame_scs: &TensorView<'_>,
         ctx: &SuperPointDecodeContext<'_>,
-    ) -> AlignmentResult<Vec<KeyPoint>> {
-        let (frame_kpts, frame_scs, frame_descs) = if kpts.ndim() == 3 {
-            (
-                kpts.index_axis(Axis(0), 0),
-                if scs.ndim() == 2 {
-                    scs.index_axis(Axis(0), 0)
-                } else {
-                    scs.view()
-                },
-                if descs.ndim() == 4 {
-                    descs.index_axis(Axis(0), 0)
-                } else {
-                    descs.view()
-                },
-            )
-        } else {
-            (kpts.view(), scs.view(), descs.view())
-        };
-
-        if frame_kpts.ndim() < 2 || frame_descs.ndim() < 3 {
-            return Err(AlignmentError::TensorLayout(
-                "Invalid SuperPoint output tensor dimensions".to_string(),
-            ));
-        }
-
-        let num_kpts = frame_kpts.shape()[0];
-        if num_kpts == 0 {
-            return Ok(Vec::new());
-        }
-
+        num_kpts: usize,
+    ) -> Vec<(usize, f32, f32, f32)> {
         let min_rx = ctx.border;
         let min_ry = ctx.border;
         let max_rx = ctx.scaled_size.width as f32 - ctx.border;
         let max_ry = ctx.scaled_size.height as f32 - ctx.border;
 
-        // 1. Batch candidate filtering: collect lightweight tuples (index, score, rx, ry)
         let mut candidates: Vec<(usize, f32, f32, f32)> =
             Vec::with_capacity(num_kpts.min(ctx.max_keypoints.saturating_mul(2)));
 
@@ -2949,12 +3052,14 @@ impl SuperPointDetector {
             }
         }
 
-        if candidates.is_empty() {
-            return Ok(Vec::new());
-        }
+        candidates
+    }
 
-        // 2. O(N) Linear-Time Top-K Selection
-        let k = candidates.len().min(ctx.max_keypoints);
+    fn select_top_k_candidates(
+        mut candidates: Vec<(usize, f32, f32, f32)>,
+        max_keypoints: usize,
+    ) -> Vec<(usize, f32, f32, f32)> {
+        let k = candidates.len().min(max_keypoints);
         if candidates.len() > k {
             candidates.select_nth_unstable_by(k - 1, |a, b| {
                 b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
@@ -2963,21 +3068,30 @@ impl SuperPointDetector {
         }
         candidates
             .sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        candidates
+    }
 
-        // 3. Batch Coordinate & Grid Sampling Calculation (Single contiguous allocation)
-        let inv_scale = 1.0 / ctx.scale;
-        let desc_channels = frame_descs.shape()[0];
-        let desc_h = frame_descs.shape()[1];
-        let desc_w = frame_descs.shape()[2];
-        let hw = desc_h * desc_w;
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::similar_names
+    )]
+    fn build_keypoint_sample_specs(
+        frame_kpts: &TensorView<'_>,
+        candidates: &[(usize, f32, f32, f32)],
+        inv_scale: f32,
+        desc_w: usize,
+        desc_h: usize,
+    ) -> Vec<KeypointSampleSpec> {
         let max_gx = (desc_w.saturating_sub(1)) as f32;
         let max_gy = (desc_h.saturating_sub(1)) as f32;
         let max_gx_idx = desc_w.saturating_sub(1);
         let max_gy_idx = desc_h.saturating_sub(1);
 
-        let mut sample_specs = Vec::with_capacity(k);
+        let mut sample_specs = Vec::with_capacity(candidates.len());
 
-        for &(i, s, rx, ry) in &candidates {
+        for &(i, s, rx, ry) in candidates {
             let kx = frame_kpts[[i, 0]];
             let ky = frame_kpts[[i, 1]];
 
@@ -3018,9 +3132,21 @@ impl SuperPointDetector {
             });
         }
 
-        // 4. SIMD Contiguous Descriptor Blending & Normalization
-        let mut keypoints = Vec::with_capacity(k);
+        sample_specs
+    }
+
+    #[allow(clippy::suboptimal_flops, clippy::cast_precision_loss)]
+    fn sample_and_normalize_descriptors(
+        frame_descs: &TensorView<'_>,
+        sample_specs: &[KeypointSampleSpec],
+    ) -> Vec<KeyPoint> {
+        let desc_channels = frame_descs.shape()[0];
+        let desc_h = frame_descs.shape()[1];
+        let desc_w = frame_descs.shape()[2];
+        let hw = desc_h * desc_w;
         let flat_descs = frame_descs.as_slice();
+
+        let mut keypoints = Vec::with_capacity(sample_specs.len());
 
         for spec in sample_specs {
             let mut d_vec = Vec::with_capacity(desc_channels);
@@ -3063,7 +3189,293 @@ impl SuperPointDetector {
             ));
         }
 
+        keypoints
+    }
+
+    /// Decodes raw `SuperPoint` ONNX tensor outputs using batch candidate filtering,
+    /// linear-time $\mathcal{O}(N)$ top-K selection, and contiguous SIMD descriptor interpolation.
+    #[allow(clippy::needless_pass_by_value)]
+    fn decode_superpoint_vectorized(
+        kpts: TensorView<'_>,
+        scs: TensorView<'_>,
+        descs: TensorView<'_>,
+        ctx: &SuperPointDecodeContext<'_>,
+    ) -> AlignmentResult<Vec<KeyPoint>> {
+        let (frame_kpts, frame_scs, frame_descs) = if kpts.ndim() == 3 {
+            (
+                kpts.index_axis(Axis(0), 0),
+                if scs.ndim() == 2 {
+                    scs.index_axis(Axis(0), 0)
+                } else {
+                    scs.view()
+                },
+                if descs.ndim() == 4 {
+                    descs.index_axis(Axis(0), 0)
+                } else {
+                    descs.view()
+                },
+            )
+        } else {
+            (kpts.view(), scs.view(), descs.view())
+        };
+
+        if frame_kpts.ndim() < 2 || frame_descs.ndim() < 3 {
+            return Err(AlignmentError::TensorLayout(
+                "Invalid SuperPoint output tensor dimensions".to_string(),
+            ));
+        }
+
+        let num_kpts = frame_kpts.shape()[0];
+        if num_kpts == 0 {
+            return Ok(Vec::new());
+        }
+
+        let candidates = Self::filter_superpoint_candidates(&frame_kpts, &frame_scs, ctx, num_kpts);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let top_candidates = Self::select_top_k_candidates(candidates, ctx.max_keypoints);
+        let desc_h = frame_descs.shape()[1];
+        let desc_w = frame_descs.shape()[2];
+        let sample_specs = Self::build_keypoint_sample_specs(
+            &frame_kpts,
+            &top_candidates,
+            1.0 / ctx.scale,
+            desc_w,
+            desc_h,
+        );
+
+        let keypoints = Self::sample_and_normalize_descriptors(&frame_descs, &sample_specs);
         Ok(keypoints)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn detect_fallback_keypoints(
+        &self,
+        img: &image::GrayImage,
+        scaled_size: Size2D<u32>,
+        scale: f32,
+    ) -> Vec<KeyPoint> {
+        let float_luma: Vec<f32> = img.as_raw().iter().map(|&b| f32::from(b) / 255.0).collect();
+
+        let corner_scores = Self::compute_luma_corner_response(&float_luma, scaled_size);
+
+        let mut nms_points = Self::non_maximum_suppression(
+            &corner_scores,
+            scaled_size,
+            self.config.nms_radius,
+            self.config.keypoint_threshold,
+            self.config.remove_borders,
+        );
+
+        nms_points.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        nms_points.truncate(self.config.max_keypoints_per_image);
+
+        let inv_scale = 1.0 / scale;
+        nms_points
+            .into_iter()
+            .map(|(pt, score)| {
+                KeyPoint::new(
+                    Point2D::new(pt.x * inv_scale, pt.y * inv_scale),
+                    score,
+                    None,
+                )
+            })
+            .collect()
+    }
+
+    fn apply_subpixel_refinement_if_enabled(
+        &self,
+        orig_img: &image::GrayImage,
+        keypoints: &mut [KeyPoint],
+    ) {
+        if self.config.subpixel_refinement {
+            refine_keypoints_subpixel_with_drift(
+                orig_img,
+                keypoints,
+                self.config.subpixel_patch_radius,
+                self.config.subpixel_max_iterations,
+                DEFAULT_SUBPIXEL_EPSILON_PX,
+                self.config.max_subpixel_drift_px,
+            );
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn try_infer_single_frame(
+        &self,
+        scaled_img: &image::GrayImage,
+        scaled_size: Size2D<u32>,
+        scale: f32,
+        delegator: &'static dyn OrientationDelegator,
+    ) -> Option<Vec<KeyPoint>> {
+        let shared_model = self.get_or_init_model()?;
+        let mut canvas_luma = vec![0.0_f32; (MODEL_CANVAS_HEIGHT * MODEL_CANVAS_WIDTH) as usize];
+        delegator.fill_inference_canvas(
+            &mut canvas_luma,
+            MODEL_CANVAS_WIDTH,
+            scaled_img,
+            scaled_size.width,
+            scaled_size.height,
+        );
+
+        let ctx = SuperPointDecodeContext {
+            delegator,
+            scaled_size,
+            scale,
+            border: self.config.remove_borders as f32,
+            score_threshold: self.config.keypoint_threshold,
+            max_keypoints: self.config.max_keypoints_per_image,
+        };
+
+        let plan_res = (|| -> AlignmentResult<Vec<KeyPoint>> {
+            let tensor = Array4::from_shape_vec(
+                (
+                    1,
+                    1,
+                    MODEL_CANVAS_HEIGHT as usize,
+                    MODEL_CANVAS_WIDTH as usize,
+                ),
+                canvas_luma,
+            )
+            .map_err(|e| {
+                AlignmentError::TensorLayout(format!("Failed to build input tensor: {e}"))
+            })?;
+
+            shared_model.infer_and_decode(tensor, &ctx)
+        })();
+
+        match plan_res {
+            Ok(kps) => Some(kps),
+            Err(e) => {
+                tracing::error!(error = %e, "ONNX SuperPoint model execution failed; falling back");
+                None
+            }
+        }
+    }
+
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    fn prepare_roi_scaled_specs(
+        full_gray: &image::GrayImage,
+        full_size: Size2D<u32>,
+        rois: &[FrameRoi],
+    ) -> AlignmentResult<Vec<RoiScaledSpec>> {
+        let mut specs = Vec::with_capacity(rois.len());
+        for roi in rois {
+            let pixel_rect = roi.bounds.to_pixel_rect(full_size);
+            if pixel_rect.width == 0 || pixel_rect.height == 0 {
+                return Err(AlignmentError::InvalidInput(
+                    "ROI pixel dimensions must be non-zero".to_string(),
+                ));
+            }
+
+            let crop = image::imageops::crop_imm(
+                full_gray,
+                pixel_rect.x,
+                pixel_rect.y,
+                pixel_rect.width,
+                pixel_rect.height,
+            )
+            .to_image();
+
+            let longest_side = pixel_rect.width.max(pixel_rect.height);
+            let (scale, scaled_width, scaled_height, scaled_img) = if longest_side
+                > POINT_DETECTION_MAX_LONGEST_EDGE
+            {
+                let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
+                let sw = (pixel_rect.width as f32 * s).round() as u32;
+                let sh = (pixel_rect.height as f32 * s).round() as u32;
+                let scaled =
+                    image::imageops::resize(&crop, sw, sh, image::imageops::FilterType::Triangle);
+                (s, sw, sh, Some(scaled))
+            } else {
+                (1.0, pixel_rect.width, pixel_rect.height, None)
+            };
+
+            specs.push(RoiScaledSpec {
+                roi: roi.clone(),
+                orig_size: pixel_rect.size(),
+                scale,
+                scaled_w: scaled_width,
+                scaled_h: scaled_height,
+                scaled_img,
+                orig_img: crop,
+            });
+        }
+        Ok(specs)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn try_infer_roi_batch(
+        &self,
+        specs: &[RoiScaledSpec],
+        delegator: &'static dyn OrientationDelegator,
+    ) -> Option<Vec<Vec<KeyPoint>>> {
+        let shared_model = self.get_or_init_model()?;
+        let n_frames = specs.len();
+
+        #[allow(clippy::significant_drop_tightening)]
+        let plan_res: AlignmentResult<Vec<Vec<KeyPoint>>> = (|| {
+            let mut all_keypoints = Vec::with_capacity(n_frames);
+
+            for spec in specs {
+                let mut canvas_luma =
+                    vec![0.0_f32; (MODEL_CANVAS_HEIGHT * MODEL_CANVAS_WIDTH) as usize];
+                delegator.fill_inference_canvas(
+                    &mut canvas_luma,
+                    MODEL_CANVAS_WIDTH,
+                    spec.active_img(),
+                    spec.scaled_w,
+                    spec.scaled_h,
+                );
+
+                let tensor = Array4::from_shape_vec(
+                    (
+                        1,
+                        1,
+                        MODEL_CANVAS_HEIGHT as usize,
+                        MODEL_CANVAS_WIDTH as usize,
+                    ),
+                    canvas_luma,
+                )
+                .map_err(|e| {
+                    AlignmentError::TensorLayout(format!("Failed to build input tensor: {e}"))
+                })?;
+
+                let ctx = SuperPointDecodeContext {
+                    delegator,
+                    scaled_size: spec.scaled_size(),
+                    scale: spec.scale,
+                    border: self.config.remove_borders as f32,
+                    score_threshold: self.config.keypoint_threshold,
+                    max_keypoints: self.config.max_keypoints_per_image,
+                };
+
+                let keypoints = shared_model.infer_and_decode(tensor, &ctx)?;
+                all_keypoints.push(keypoints);
+            }
+
+            if all_keypoints.len() == n_frames {
+                Ok(all_keypoints)
+            } else {
+                Err(AlignmentError::Inference(
+                    "Incomplete frame inference results".to_string(),
+                ))
+            }
+        })();
+
+        match plan_res {
+            Ok(all_kps) => Some(all_kps),
+            Err(e) => {
+                tracing::warn!(error = %e, "ONNX SuperPoint execution failed; falling back");
+                None
+            }
+        }
     }
 }
 
@@ -3131,17 +3543,141 @@ pub fn refine_keypoints_subpixel(
 /// refine_keypoints_subpixel_with_drift(&img, &mut kps, 5, 5, 0.01, 2.0);
 /// assert!(kps[0].point.x >= 14.0 && kps[0].point.x <= 16.5);
 /// ```
+#[derive(Debug, Clone, Copy, Default)]
+struct StructureTensor2x2 {
+    a: f32, // sum w * Ix^2
+    b: f32, // sum w * Ix * Iy
+    c: f32, // sum w * Iy^2
+}
+
+impl StructureTensor2x2 {
+    #[inline]
+    const fn new(a: f32, b: f32, c: f32) -> Self {
+        Self { a, b, c }
+    }
+
+    #[inline]
+    #[allow(
+        clippy::suspicious_operation_groupings,
+        clippy::suboptimal_flops,
+        clippy::manual_midpoint
+    )]
+    fn solve_step(self, vx: f32, vy: f32) -> Result<(f32, f32), SubpixelStatus> {
+        let det = self.a * self.c - self.b * self.b;
+        let tr = self.a + self.c;
+
+        if det < 1e-7 || tr < 1e-5 {
+            return Err(SubpixelStatus::PoorConditioning {
+                min_eigenvalue: 0.0,
+                cond_ratio: 0.0,
+            });
+        }
+
+        let trace_sq_minus_4det = (tr * tr - 4.0 * det).max(0.0);
+        let sqrt_term = trace_sq_minus_4det.sqrt();
+        let lambda_min = 0.5 * (tr - sqrt_term);
+        let lambda_max = 0.5 * (tr + sqrt_term);
+        let cond_ratio = if lambda_max > 1e-6 {
+            lambda_min / lambda_max
+        } else {
+            0.0
+        };
+
+        if lambda_min < 1e-5 {
+            return Err(SubpixelStatus::PoorConditioning {
+                min_eigenvalue: lambda_min,
+                cond_ratio,
+            });
+        }
+
+        let inv_det = 1.0 / det;
+        let step_x = (self.c * vx - self.b * vy) * inv_det;
+        let step_y = (-self.b * vx + self.a * vy) * inv_det;
+        Ok((step_x, step_y))
+    }
+}
+
+#[allow(
+    clippy::many_single_char_names,
+    clippy::suboptimal_flops,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments,
+    clippy::similar_names
+)]
+fn accumulate_patch_gradients(
+    raw: &[u8],
+    w: usize,
+    cx_round: isize,
+    cy_round: isize,
+    x_curr: f32,
+    y_curr: f32,
+    r: isize,
+    inv_two_sigma_sq: f32,
+) -> (StructureTensor2x2, f32, f32) {
+    let mut a = 0.0_f32;
+    let mut b = 0.0_f32;
+    let mut c = 0.0_f32;
+    let mut vx = 0.0_f32;
+    let mut vy = 0.0_f32;
+
+    let mut weight_x_arr = [0.0_f32; 33];
+    let mut delta_x_arr = [0.0_f32; 33];
+    for (idx, dx) in (-r..=r).enumerate() {
+        let delta_x = ((cx_round + dx) as f32) - x_curr;
+        delta_x_arr[idx] = delta_x;
+        weight_x_arr[idx] = (-delta_x * delta_x * inv_two_sigma_sq).exp();
+    }
+
+    for dy in -r..=r {
+        let py = (cy_round + dy) as usize;
+        let delta_y = ((cy_round + dy) as f32) - y_curr;
+        let weight_y = (-delta_y * delta_y * inv_two_sigma_sq).exp();
+
+        let row = &raw[py * w..(py + 1) * w];
+        let prev_row = &raw[(py - 1) * w..py * w];
+        let next_row = &raw[(py + 1) * w..(py + 2) * w];
+
+        for (idx_x, dx) in (-r..=r).enumerate() {
+            let px = (cx_round + dx) as usize;
+            let delta_x = delta_x_arr[idx_x];
+            let weight = weight_y * weight_x_arr[idx_x];
+
+            let ix = 0.5 * (f32::from(row[px + 1]) - f32::from(row[px - 1])) * (1.0 / 255.0);
+            let iy = 0.5 * (f32::from(next_row[px]) - f32::from(prev_row[px])) * (1.0 / 255.0);
+
+            let ix2 = ix * ix;
+            let iy2 = iy * iy;
+            let ixy = ix * iy;
+
+            a += weight * ix2;
+            b += weight * ixy;
+            c += weight * iy2;
+
+            vx += weight * (ix2 * delta_x + ixy * delta_y);
+            vy += weight * (ixy * delta_x + iy2 * delta_y);
+        }
+    }
+
+    (StructureTensor2x2::new(a, b, c), vx, vy)
+}
+
+/// Refines keypoint locations to sub-pixel accuracy using iterative Gaussian-weighted Lucas-Kanade with maximum drift bounding.
+///
+/// # Arguments
+/// * `image` - Source single-channel grayscale image.
+/// * `keypoints` - Mutable slice of keypoints to refine in-place.
+/// * `radius` - Patch radius for structure tensor calculation (e.g. 3 for a 7x7 patch).
+/// * `max_iterations` - Maximum refinement iterations per keypoint.
+/// * `epsilon` - Convergence threshold for iteration step magnitude.
+/// * `max_drift_px` - Maximum allowed drift in pixels from initial position before fallback.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
     clippy::cast_sign_loss,
-    clippy::many_single_char_names,
     clippy::suboptimal_flops,
-    clippy::similar_names,
-    clippy::suspicious_operation_groupings,
-    clippy::too_many_lines,
-    clippy::manual_midpoint
+    clippy::similar_names
 )]
 pub fn refine_keypoints_subpixel_with_drift(
     image: &image::GrayImage,
@@ -3191,12 +3727,6 @@ pub fn refine_keypoints_subpixel_with_drift(
 
         for iter in 0..max_iterations {
             iters_done = iter + 1;
-            let mut a = 0.0_f32; // sum w * Ix^2
-            let mut b = 0.0_f32; // sum w * Ix * Iy
-            let mut c = 0.0_f32; // sum w * Iy^2
-            let mut vx = 0.0_f32; // sum w * (Ix^2 * delta_x + Ix * Iy * delta_y)
-            let mut vy = 0.0_f32; // sum w * (Ix * Iy * delta_x + Iy^2 * delta_y)
-
             let cx_round = x_curr.round() as isize;
             let cy_round = y_curr.round() as isize;
 
@@ -3209,86 +3739,24 @@ pub fn refine_keypoints_subpixel_with_drift(
                 break;
             }
 
-            // Precompute 1D separable horizontal Gaussian kernel weights and delta_x on stack
-            let mut weight_x_arr = [0.0_f32; 33];
-            let mut delta_x_arr = [0.0_f32; 33];
-            for (idx, dx) in (-r..=r).enumerate() {
-                let delta_x = ((cx_round + dx) as f32) - x_curr;
-                delta_x_arr[idx] = delta_x;
-                weight_x_arr[idx] = (-delta_x * delta_x * inv_two_sigma_sq).exp();
-            }
+            let (tensor, vx, vy) = accumulate_patch_gradients(
+                raw,
+                w,
+                cx_round,
+                cy_round,
+                x_curr,
+                y_curr,
+                r,
+                inv_two_sigma_sq,
+            );
 
-            for dy in -r..=r {
-                let py = (cy_round + dy) as usize;
-                let delta_y = ((cy_round + dy) as f32) - y_curr;
-                let weight_y = (-delta_y * delta_y * inv_two_sigma_sq).exp();
-
-                let row = &raw[py * w..(py + 1) * w];
-                let prev_row = &raw[(py - 1) * w..py * w];
-                let next_row = &raw[(py + 1) * w..(py + 2) * w];
-
-                for (idx_x, dx) in (-r..=r).enumerate() {
-                    let px = (cx_round + dx) as usize;
-                    let delta_x = delta_x_arr[idx_x];
-                    let weight = weight_y * weight_x_arr[idx_x];
-
-                    // Branchless contiguous central gradient evaluation
-                    let ix =
-                        0.5 * (f32::from(row[px + 1]) - f32::from(row[px - 1])) * (1.0 / 255.0);
-                    let iy =
-                        0.5 * (f32::from(next_row[px]) - f32::from(prev_row[px])) * (1.0 / 255.0);
-
-                    let ix2 = ix * ix;
-                    let iy2 = iy * iy;
-                    let ixy = ix * iy;
-
-                    a += weight * ix2;
-                    b += weight * ixy;
-                    c += weight * iy2;
-
-                    vx += weight * (ix2 * delta_x + ixy * delta_y);
-                    vy += weight * (ixy * delta_x + iy2 * delta_y);
+            let (step_x, step_y) = match tensor.solve_step(vx, vy) {
+                Ok(step) => step,
+                Err(err_status) => {
+                    status = err_status;
+                    break;
                 }
-            }
-
-            let det = a * c - b * b;
-            let tr = a + c;
-
-            // Structure tensor conditioning check (ensure non-degenerate 2D corner)
-            if det < 1e-7 || tr < 1e-5 {
-                status = SubpixelStatus::PoorConditioning {
-                    min_eigenvalue: 0.0,
-                    cond_ratio: 0.0,
-                };
-                break;
-            }
-
-            let trace_sq_minus_4det = (tr * tr - 4.0 * det).max(0.0);
-            let sqrt_term = trace_sq_minus_4det.sqrt();
-            // Note (Eigenvalues vs Midpoint): Explicit `0.5 * (tr +- sqrt_term)` reflects the analytical
-            // quadratic 2x2 eigenvalue formula `(tr +- sqrt(tr^2 - 4*det)) / 2`. `f32::midpoint(tr, sqrt_term)`
-            // avoids intermediate overflow on huge floats, but normalized gradient traces here are strictly
-            // bounded (0.0..~10.0), making overflow impossible while preserving notation symmetry with `lambda_min`.
-            let lambda_min = 0.5 * (tr - sqrt_term);
-            let lambda_max = 0.5 * (tr + sqrt_term);
-            let cond_ratio = if lambda_max > 1e-6 {
-                lambda_min / lambda_max
-            } else {
-                0.0
             };
-
-            if lambda_min < 1e-5 {
-                status = SubpixelStatus::PoorConditioning {
-                    min_eigenvalue: lambda_min,
-                    cond_ratio,
-                };
-                break;
-            }
-
-            // Solve 2x2 linear system G * [step_x; step_y] = [vx; vy]
-            let inv_det = 1.0 / det;
-            let step_x = (c * vx - b * vy) * inv_det;
-            let step_y = (-b * vx + a * vy) * inv_det;
 
             let step_norm_sq = step_x * step_x + step_y * step_y;
             if step_norm_sq > max_step_sq || step_x.is_nan() || step_y.is_nan() {
@@ -3301,7 +3769,6 @@ pub fn refine_keypoints_subpixel_with_drift(
             let drift_sq =
                 (x_curr - x_init) * (x_curr - x_init) + (y_curr - y_init) * (y_curr - y_init);
             if drift_sq > max_drift_sq {
-                // Revert to initial if displacement wandered too far
                 let drift_px = drift_sq.sqrt();
                 x_curr = x_init;
                 y_curr = y_init;
@@ -3343,16 +3810,79 @@ pub const MODEL_CANVAS_HEIGHT: u32 = 720;
 /// Standard model inference canvas width (1280 pixels).
 pub const MODEL_CANVAS_WIDTH: u32 = 1280;
 
-impl PointDetector for SuperPointDetector {
+struct ScaledLumaBuffer {
+    scale: f32,
+    scaled_size: Size2D<u32>,
+    orig_img: image::GrayImage,
+    scaled_img: image::GrayImage,
+}
+
+impl ScaledLumaBuffer {
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::many_single_char_names,
-        clippy::suboptimal_flops,
-        clippy::too_many_lines,
-        clippy::needless_range_loop
+        clippy::cast_sign_loss
     )]
+    fn from_luma_slice(luma: &[f32], size: Size2D<u32>) -> Self {
+        let longest_side = size.width.max(size.height);
+        let (scale, scaled_width, scaled_height) =
+            if longest_side > POINT_DETECTION_MAX_LONGEST_EDGE {
+                let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
+                let sw = (size.width as f32 * s).round() as u32;
+                let sh = (size.height as f32 * s).round() as u32;
+                (s, sw, sh)
+            } else {
+                (1.0, size.width, size.height)
+            };
+
+        let raw_bytes: Vec<u8> = luma
+            .iter()
+            .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+            .collect();
+        let orig_img = image::GrayImage::from_raw(size.width, size.height, raw_bytes)
+            .unwrap_or_else(|| image::GrayImage::new(size.width, size.height));
+
+        let scaled_img = if scaled_width == size.width && scaled_height == size.height {
+            orig_img.clone()
+        } else {
+            image::imageops::resize(
+                &orig_img,
+                scaled_width,
+                scaled_height,
+                image::imageops::FilterType::Triangle,
+            )
+        };
+
+        Self {
+            scale,
+            scaled_size: Size2D::new(scaled_width, scaled_height),
+            orig_img,
+            scaled_img,
+        }
+    }
+}
+
+struct RoiScaledSpec {
+    roi: FrameRoi,
+    orig_size: Size2D<u32>,
+    scale: f32,
+    scaled_w: u32,
+    scaled_h: u32,
+    scaled_img: Option<image::GrayImage>,
+    orig_img: image::GrayImage,
+}
+
+impl RoiScaledSpec {
+    fn active_img(&self) -> &image::GrayImage {
+        self.scaled_img.as_ref().unwrap_or(&self.orig_img)
+    }
+
+    const fn scaled_size(&self) -> Size2D<u32> {
+        Size2D::new(self.scaled_w, self.scaled_h)
+    }
+}
+
+impl PointDetector for SuperPointDetector {
     fn detect_luma(&self, luma: &[f32], size: Size2D<u32>) -> AlignmentResult<Vec<KeyPoint>> {
         if size.width == 0 || size.height == 0 {
             return Err(AlignmentError::InvalidInput(
@@ -3371,142 +3901,19 @@ impl PointDetector for SuperPointDetector {
             )));
         }
 
-        // 1. Longest edge scaling: clamp longest side to POINT_DETECTION_MAX_LONGEST_EDGE (720)
-        let longest_side = size.width.max(size.height);
-        let (scale, scaled_w, scaled_h) = if longest_side > POINT_DETECTION_MAX_LONGEST_EDGE {
-            let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
-            let sw = (size.width as f32 * s).round() as u32;
-            let sh = (size.height as f32 * s).round() as u32;
-            (s, sw, sh)
-        } else {
-            (1.0, size.width, size.height)
-        };
-
-        // Convert slice to GrayImage for external imageops::resize (YAGNI standard API)
-        let raw_bytes: Vec<u8> = luma
-            .iter()
-            .map(|&v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
-            .collect();
-        let gray_orig = image::GrayImage::from_raw(size.width, size.height, raw_bytes)
-            .unwrap_or_else(|| image::GrayImage::new(size.width, size.height));
-
-        let scaled_img = if scaled_w == size.width && scaled_h == size.height {
-            gray_orig.clone()
-        } else {
-            image::imageops::resize(
-                &gray_orig,
-                scaled_w,
-                scaled_h,
-                image::imageops::FilterType::Triangle,
-            )
-        };
-
-        let border = self.config.remove_borders as f32;
+        let prep = ScaledLumaBuffer::from_luma_slice(luma, size);
         let orientation = StripOrientation::from_size(size).unwrap_or(StripOrientation::Horizontal);
         let delegator = orientation.delegator();
 
-        // 2. Attempt neural model inference via tract-onnx with graceful fallback if model is unavailable
-        let model_shared = self.get_or_init_model();
+        let mut keypoints = if let Some(kps) =
+            self.try_infer_single_frame(&prep.scaled_img, prep.scaled_size, prep.scale, delegator)
+        {
+            kps
+        } else {
+            self.detect_fallback_keypoints(&prep.scaled_img, prep.scaled_size, prep.scale)
+        };
 
-        if let Some(shared_model) = model_shared {
-            let mut canvas_luma =
-                vec![0.0_f32; (MODEL_CANVAS_HEIGHT * MODEL_CANVAS_WIDTH) as usize];
-            delegator.fill_inference_canvas(
-                &mut canvas_luma,
-                MODEL_CANVAS_WIDTH,
-                &scaled_img,
-                scaled_w,
-                scaled_h,
-            );
-
-            let ctx = SuperPointDecodeContext {
-                delegator,
-                scaled_size: Size2D::new(scaled_w, scaled_h),
-                scale,
-                border,
-                score_threshold: self.config.keypoint_threshold,
-                max_keypoints: self.config.max_keypoints_per_image,
-            };
-
-            let plan_res = (|| -> AlignmentResult<Vec<KeyPoint>> {
-                let tensor = Array4::from_shape_vec(
-                    (
-                        1,
-                        1,
-                        MODEL_CANVAS_HEIGHT as usize,
-                        MODEL_CANVAS_WIDTH as usize,
-                    ),
-                    canvas_luma,
-                )
-                .map_err(|e| {
-                    AlignmentError::TensorLayout(format!("Failed to build input tensor: {e}"))
-                })?;
-
-                shared_model.infer_and_decode(tensor, &ctx)
-            })();
-
-            match plan_res {
-                Ok(mut kps) => {
-                    if self.config.subpixel_refinement {
-                        refine_keypoints_subpixel_with_drift(
-                            &gray_orig,
-                            &mut kps,
-                            self.config.subpixel_patch_radius,
-                            self.config.subpixel_max_iterations,
-                            DEFAULT_SUBPIXEL_EPSILON_PX,
-                            self.config.max_subpixel_drift_px,
-                        );
-                    }
-                    return Ok(kps);
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "ONNX SuperPoint model execution failed; falling back");
-                }
-            }
-        }
-
-        // Baseline fallback when neural model is offline
-        let float_luma: Vec<f32> = scaled_img
-            .as_raw()
-            .iter()
-            .map(|&b| f32::from(b) / 255.0)
-            .collect();
-
-        let corner_scores =
-            Self::compute_luma_corner_response(&float_luma, Size2D::new(scaled_w, scaled_h));
-
-        let nms_points = Self::non_maximum_suppression(
-            &corner_scores,
-            Size2D::new(scaled_w, scaled_h),
-            self.config.nms_radius,
-            self.config.keypoint_threshold,
-            self.config.remove_borders,
-        );
-
-        let inv_scale = 1.0 / scale;
-        let mut keypoints: Vec<KeyPoint> = nms_points
-            .into_iter()
-            .take(self.config.max_keypoints_per_image)
-            .map(|(pt, score)| {
-                KeyPoint::new(
-                    Point2D::new(pt.x * inv_scale, pt.y * inv_scale),
-                    score,
-                    None,
-                )
-            })
-            .collect();
-
-        if self.config.subpixel_refinement {
-            refine_keypoints_subpixel_with_drift(
-                &gray_orig,
-                &mut keypoints,
-                self.config.subpixel_patch_radius,
-                self.config.subpixel_max_iterations,
-                DEFAULT_SUBPIXEL_EPSILON_PX,
-                self.config.max_subpixel_drift_px,
-            );
-        }
-
+        self.apply_subpixel_refinement_if_enabled(&prep.orig_img, &mut keypoints);
         Ok(keypoints)
     }
 
@@ -3570,14 +3977,6 @@ impl PointDetector for SuperPointDetector {
             .ok_or_else(|| AlignmentError::Inference("Failed to extract feature frame".to_string()))
     }
 
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::many_single_char_names,
-        clippy::suboptimal_flops,
-        clippy::too_many_lines
-    )]
     #[tracing::instrument(skip(self, luma, rois, tap), level = "debug")]
     /// Detects keypoints and descriptors for multiple frame ROIs within a single luma image.
     ///
@@ -3589,176 +3988,23 @@ impl PointDetector for SuperPointDetector {
         rois: &[FrameRoi],
         tap: Option<&dyn AlignmentDiagnosticTap>,
     ) -> AlignmentResult<Vec<FeatureFrame>> {
-        struct ScaledSpec {
-            roi: FrameRoi,
-            orig_size: Size2D<u32>,
-            scale: f32,
-            scaled_w: u32,
-            scaled_h: u32,
-            scaled_img: Option<image::GrayImage>,
-            orig_img: image::GrayImage,
-        }
-
         if rois.is_empty() {
             return Ok(Vec::new());
         }
 
         let full_gray = luma.to_gray_image();
-
-        let mut specs = Vec::with_capacity(rois.len());
-        for roi in rois {
-            let pixel_rect = roi.bounds.to_pixel_rect(luma.size());
-            if pixel_rect.width == 0 || pixel_rect.height == 0 {
-                return Err(AlignmentError::InvalidInput(
-                    "ROI pixel dimensions must be non-zero".to_string(),
-                ));
-            }
-
-            let crop = image::imageops::crop_imm(
-                &full_gray,
-                pixel_rect.x,
-                pixel_rect.y,
-                pixel_rect.width,
-                pixel_rect.height,
-            )
-            .to_image();
-
-            let longest_side = pixel_rect.width.max(pixel_rect.height);
-            let (scale, scaled_w, scaled_h, scaled_img) = if longest_side
-                > POINT_DETECTION_MAX_LONGEST_EDGE
-            {
-                let s = POINT_DETECTION_MAX_LONGEST_EDGE as f32 / longest_side as f32;
-                let sw = (pixel_rect.width as f32 * s).round() as u32;
-                let sh = (pixel_rect.height as f32 * s).round() as u32;
-                let scaled =
-                    image::imageops::resize(&crop, sw, sh, image::imageops::FilterType::Triangle);
-                (s, sw, sh, Some(scaled))
-            } else {
-                (1.0, pixel_rect.width, pixel_rect.height, None)
-            };
-
-            specs.push(ScaledSpec {
-                roi: roi.clone(),
-                orig_size: pixel_rect.size(),
-                scale,
-                scaled_w,
-                scaled_h,
-                scaled_img,
-                orig_img: crop,
-            });
-        }
-
-        let n_frames = specs.len();
-        let delegator = luma.orientation.delegator();
-
-        let mut batched_results: Option<Vec<Vec<KeyPoint>>> = None;
-        let model_shared = self.get_or_init_model();
-
-        if let Some(shared_model) = model_shared {
-            #[allow(clippy::significant_drop_tightening)]
-            let plan_res: AlignmentResult<Vec<Vec<KeyPoint>>> = (|| {
-                let mut all_keypoints = Vec::with_capacity(n_frames);
-
-                for spec in &specs {
-                    let mut canvas_luma =
-                        vec![0.0_f32; (MODEL_CANVAS_HEIGHT * MODEL_CANVAS_WIDTH) as usize];
-                    let active_img = spec.scaled_img.as_ref().unwrap_or(&spec.orig_img);
-                    delegator.fill_inference_canvas(
-                        &mut canvas_luma,
-                        MODEL_CANVAS_WIDTH,
-                        active_img,
-                        spec.scaled_w,
-                        spec.scaled_h,
-                    );
-
-                    let tensor = Array4::from_shape_vec(
-                        (
-                            1,
-                            1,
-                            MODEL_CANVAS_HEIGHT as usize,
-                            MODEL_CANVAS_WIDTH as usize,
-                        ),
-                        canvas_luma,
-                    )
-                    .map_err(|e| {
-                        AlignmentError::TensorLayout(format!("Failed to build input tensor: {e}"))
-                    })?;
-
-                    let ctx = SuperPointDecodeContext {
-                        delegator,
-                        scaled_size: Size2D::new(spec.scaled_w, spec.scaled_h),
-                        scale: spec.scale,
-                        border: self.config.remove_borders as f32,
-                        score_threshold: self.config.keypoint_threshold,
-                        max_keypoints: self.config.max_keypoints_per_image,
-                    };
-
-                    let keypoints = shared_model.infer_and_decode(tensor, &ctx)?;
-                    all_keypoints.push(keypoints);
-                }
-
-                if all_keypoints.len() == n_frames {
-                    Ok(all_keypoints)
-                } else {
-                    Err(AlignmentError::Inference(
-                        "Incomplete frame inference results".to_string(),
-                    ))
-                }
-            })();
-
-            match plan_res {
-                Ok(all_kps) => {
-                    batched_results = Some(all_kps);
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "ONNX SuperPoint execution failed; falling back");
-                }
-            }
-        }
+        let specs = Self::prepare_roi_scaled_specs(&full_gray, luma.size(), rois)?;
+        let batched_results = self.try_infer_roi_batch(&specs, luma.orientation.delegator());
 
         let mut results = Vec::with_capacity(specs.len());
         for (b_idx, spec) in specs.into_iter().enumerate() {
             let mut keypoints = if let Some(ref all_kps) = batched_results {
                 all_kps.get(b_idx).cloned().unwrap_or_default()
             } else {
-                let active_img = spec.scaled_img.as_ref().unwrap_or(&spec.orig_img);
-                let float_luma: Vec<f32> = active_img
-                    .as_raw()
-                    .iter()
-                    .map(|&b| f32::from(b) / 255.0)
-                    .collect();
-                let scaled_size = Size2D::new(spec.scaled_w, spec.scaled_h);
-                let scores = Self::compute_luma_corner_response(&float_luma, scaled_size);
-                let mut raw_kps = Self::non_maximum_suppression(
-                    &scores,
-                    scaled_size,
-                    self.config.nms_radius,
-                    self.config.keypoint_threshold,
-                    self.config.remove_borders,
-                );
-                raw_kps.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                raw_kps.truncate(self.config.max_keypoints_per_image);
-
-                raw_kps
-                    .into_iter()
-                    .map(|(pt, score)| {
-                        let ox = pt.x / spec.scale;
-                        let oy = pt.y / spec.scale;
-                        KeyPoint::new(Point2D::new(ox, oy), score, None)
-                    })
-                    .collect()
+                self.detect_fallback_keypoints(spec.active_img(), spec.scaled_size(), spec.scale)
             };
 
-            if self.config.subpixel_refinement {
-                refine_keypoints_subpixel_with_drift(
-                    &spec.orig_img,
-                    &mut keypoints,
-                    self.config.subpixel_patch_radius,
-                    self.config.subpixel_max_iterations,
-                    DEFAULT_SUBPIXEL_EPSILON_PX,
-                    self.config.max_subpixel_drift_px,
-                );
-            }
+            self.apply_subpixel_refinement_if_enabled(&spec.orig_img, &mut keypoints);
 
             let frame =
                 FeatureFrame::new(spec.roi.index, spec.roi.bounds, spec.orig_size, keypoints);

@@ -914,42 +914,40 @@ pub fn catmull_rom_basis(t: f32) -> [f32; 4] {
     vec4_mat4_mul(monomial_time_vec4(t), &CATMULL_ROM_BASIS_MATRIX)
 }
 
+/// Evaluates spline interpolation across 4 control points in $D$ spatial dimensions via FMA dot products: $\mathbf{p}(t) = \mathbf{P}^T \cdot \mathbf{b}(t)$.
+#[inline]
+#[must_use]
+pub(crate) fn interpolate_spline<const D: usize>(p: &[[f32; D]; 4], basis: [f32; 4]) -> [f32; D] {
+    let mut out = [0.0_f32; D];
+    for d in 0..D {
+        out[d] = basis[0].mul_add(
+            p[0][d],
+            basis[1].mul_add(p[1][d], basis[2].mul_add(p[2][d], basis[3] * p[3][d])),
+        );
+    }
+    out
+}
+
 /// Interpolates a 1D scalar across 4 B-spline control points via FMA dot product.
 #[inline]
 #[must_use]
 pub fn interpolate_bspline_1d(p: &[f32; 4], t: f32) -> f32 {
-    let b = cubic_bspline_basis(t);
-    b[0].mul_add(p[0], b[1].mul_add(p[1], b[2].mul_add(p[2], b[3] * p[3])))
+    let p_1d = [[p[0]], [p[1]], [p[2]], [p[3]]];
+    interpolate_spline(&p_1d, cubic_bspline_basis(t))[0]
 }
 
 /// Interpolates a 2D point across 4 B-spline control points via vectorized FMA dot product.
 #[inline]
 #[must_use]
 pub fn interpolate_bspline_2d(p: &[[f32; 2]; 4], t: f32) -> [f32; 2] {
-    let b = cubic_bspline_basis(t);
-    let mut out = [0.0_f32; 2];
-    for (i, v) in out.iter_mut().enumerate() {
-        *v = b[0].mul_add(
-            p[0][i],
-            b[1].mul_add(p[1][i], b[2].mul_add(p[2][i], b[3] * p[3][i])),
-        );
-    }
-    out
+    interpolate_spline(p, cubic_bspline_basis(t))
 }
 
 /// Interpolates a 3D point across 4 B-spline control points via vectorized FMA dot product.
 #[inline]
 #[must_use]
 pub fn interpolate_bspline_3d(p: &[[f32; 3]; 4], t: f32) -> [f32; 3] {
-    let b = cubic_bspline_basis(t);
-    let mut out = [0.0_f32; 3];
-    for (i, v) in out.iter_mut().enumerate() {
-        *v = b[0].mul_add(
-            p[0][i],
-            b[1].mul_add(p[1][i], b[2].mul_add(p[2][i], b[3] * p[3][i])),
-        );
-    }
-    out
+    interpolate_spline(p, cubic_bspline_basis(t))
 }
 
 /// Interpolates a 3D position using Catmull-Rom spline passing exactly through $p_1$ and $p_2$.
@@ -962,15 +960,8 @@ pub fn interpolate_catmull_rom_3d(
     p3: [f32; 3],
     t: f32,
 ) -> [f32; 3] {
-    let w = catmull_rom_basis(t);
-    let mut out = [0.0_f32; 3];
-    for (i, v) in out.iter_mut().enumerate() {
-        *v = w[0].mul_add(
-            p0[i],
-            w[1].mul_add(p1[i], w[2].mul_add(p2[i], w[3] * p3[i])),
-        );
-    }
-    out
+    let p = [p0, p1, p2, p3];
+    interpolate_spline(&p, catmull_rom_basis(t))
 }
 
 /// Unit quaternion representing 3D spatial rotation in $\mathrm{SO}(3)$.

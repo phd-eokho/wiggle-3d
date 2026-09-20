@@ -5,7 +5,7 @@
 
 use crate::color::Bt709LumaConverter;
 use crate::detector::{PillarStatsDetector, RoiDetectionConfig, RoiDetector};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::face::RetinaFaceDetector;
 use crate::feature::AlignmentDiagnosticTap;
 use crate::geom::FrameRoiSet;
@@ -630,43 +630,108 @@ fn stage_decode_and_roi(
     })
 }
 
+fn detect_faces_for_sub_frames(
+    crops: &[DynamicImage],
+    file_stem: &str,
+) -> Vec<crate::visualizer::FrameFaceRecord> {
+    if crops.is_empty() {
+        return Vec::new();
+    }
+    match RetinaFaceDetector::default_engine() {
+        Ok(face_detector) => match face_detector.detect_faces_for_rois(crops) {
+            Ok(records) => {
+                let total_faces: usize = records.iter().map(|(_, list, _)| list.len()).sum();
+                if total_faces > 0 {
+                    tracing::debug!(
+                        file = %file_stem,
+                        faces = total_faces,
+                        "Detected faces across sub-frames"
+                    );
+                }
+                records
+            }
+            Err(e) => {
+                tracing::warn!(file = %file_stem, error = %e, "Failed to run face detection on sub-frames");
+                Vec::new()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(file = %file_stem, error = %e, "Failed to initialize RetinaFace detector");
+            Vec::new()
+        }
+    }
+}
+
+fn extract_dominant_face_bbox(
+    frame_faces: &[crate::visualizer::FrameFaceRecord],
+) -> Option<crate::geom::NormalizedRect> {
+    frame_faces
+        .iter()
+        .find(|(f_idx, _, dom_idx)| *f_idx == 1 && dom_idx.is_some())
+        .and_then(|(_, detections, dom_idx)| {
+            dom_idx.and_then(|idx| detections.get(idx).map(|f| f.bbox))
+        })
+        .or_else(|| {
+            frame_faces.iter().find_map(|(_, detections, dom_idx)| {
+                dom_idx.and_then(|idx| detections.get(idx).map(|f| f.bbox))
+            })
+        })
+}
+
+fn compute_alignment_shifts(
+    features: &[crate::feature::FeatureFrame],
+    triplets: &[crate::feature::FeatureTriplet],
+    pairs: &[(crate::feature::FramePair, Vec<crate::feature::FeatureMatch>)],
+    dominant_face_bbox: Option<crate::geom::NormalizedRect>,
+) -> [(f32, f32); 3] {
+    if !triplets.is_empty() {
+        crate::gif::WiggleAligner::compute_depth_surface_shifts_from_triplets_with_face_priority(
+            features,
+            triplets,
+            dominant_face_bbox,
+            crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+            crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+        )
+    } else if !pairs.is_empty() {
+        crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
+            features,
+            pairs,
+            dominant_face_bbox,
+            crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
+            crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
+        )
+    } else {
+        [(0.0, 0.0); 3]
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn align_and_crop_payload(
+    crops: &[DynamicImage],
+    orig_w: u32,
+    orig_h: u32,
+    luma_w: u32,
+    luma_h: u32,
+    shifts: &[(f32, f32); 3],
+) -> Result<Option<Vec<image::RgbaImage>>> {
+    if crops.is_empty() {
+        return Ok(None);
+    }
+    let scale_x = orig_w as f32 / luma_w as f32;
+    let scale_y = orig_h as f32 / luma_h as f32;
+    let scaled_shifts: Vec<(f32, f32)> = shifts
+        .iter()
+        .map(|&(dx, dy)| (dx * scale_x, dy * scale_y))
+        .collect();
+    let aligned = crate::gif::WiggleAligner::align_and_crop(crops, &scaled_shifts)?;
+    Ok(Some(aligned))
+}
+
 /// Stage 2: Concurrent neural face/feature detection, descriptor matching, and sub-frame alignment.
-#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStagePayload> {
     // Run Face Detection and SuperPoint Feature Extraction concurrently via rayon::join
     let (frame_faces, feature_frames_res) = rayon::join(
-        || {
-            if payload.sub_frame_crops.is_empty() {
-                Vec::new()
-            } else {
-                match RetinaFaceDetector::default_engine() {
-                    Ok(face_detector) => {
-                        match face_detector.detect_faces_for_rois(&payload.sub_frame_crops) {
-                            Ok(records) => {
-                                let total_faces: usize =
-                                    records.iter().map(|(_, list, _)| list.len()).sum();
-                                if total_faces > 0 {
-                                    tracing::debug!(
-                                        file = %payload.file_stem,
-                                        faces = total_faces,
-                                        "Detected faces across sub-frames"
-                                    );
-                                }
-                                records
-                            }
-                            Err(e) => {
-                                tracing::warn!(file = %payload.file_stem, error = %e, "Failed to run face detection on sub-frames");
-                                Vec::new()
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(file = %payload.file_stem, error = %e, "Failed to initialize RetinaFace detector");
-                        Vec::new()
-                    }
-                }
-            }
-        },
+        || detect_faces_for_sub_frames(&payload.sub_frame_crops, &payload.file_stem),
         || {
             use crate::feature::{PointDetector, SuperPointConfig, SuperPointDetector};
             let point_detector = SuperPointDetector::new(SuperPointConfig {
@@ -688,17 +753,7 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
         "Detected frame keypoints"
     );
 
-    let dominant_face_bbox = frame_faces
-        .iter()
-        .find(|(f_idx, _, dom_idx)| *f_idx == 1 && dom_idx.is_some())
-        .and_then(|(_, detections, dom_idx)| {
-            dom_idx.and_then(|idx| detections.get(idx).map(|f| f.bbox))
-        })
-        .or_else(|| {
-            frame_faces.iter().find_map(|(_, detections, dom_idx)| {
-                dom_idx.and_then(|idx| detections.get(idx).map(|f| f.bbox))
-            })
-        });
+    let dominant_face_bbox = extract_dominant_face_bbox(&frame_faces);
 
     let (triplets, pairs) = match_features(
         &payload.file_stem,
@@ -710,40 +765,15 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
         &frame_faces,
     )?;
 
-    let mut shifts = [(0.0, 0.0); 3];
-    if !triplets.is_empty() {
-        shifts = crate::gif::WiggleAligner::compute_depth_surface_shifts_from_triplets_with_face_priority(
-            &features,
-            &triplets,
-            dominant_face_bbox,
-            crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
-            crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
-        );
-    } else if !pairs.is_empty() {
-        shifts =
-            crate::gif::WiggleAligner::compute_depth_surface_shifts_from_pairs_with_face_priority(
-                &features,
-                &pairs,
-                dominant_face_bbox,
-                crate::gif::DEFAULT_DISPARITY_BIN_SIZE_PX,
-                crate::gif::DEFAULT_CLUSTER_TOLERANCE_PX,
-            );
-    }
-
-    let aligned_frames = if payload.sub_frame_crops.is_empty() {
-        None
-    } else {
-        let scale_x = payload.dynamic_img.width() as f32 / payload.luma_image.width as f32;
-        let scale_y = payload.dynamic_img.height() as f32 / payload.luma_image.height as f32;
-        let scaled_shifts: Vec<(f32, f32)> = shifts
-            .iter()
-            .map(|&(dx, dy)| (dx * scale_x, dy * scale_y))
-            .collect();
-        Some(crate::gif::WiggleAligner::align_and_crop(
-            &payload.sub_frame_crops,
-            &scaled_shifts,
-        )?)
-    };
+    let shifts = compute_alignment_shifts(&features, &triplets, &pairs, dominant_face_bbox);
+    let aligned_frames = align_and_crop_payload(
+        &payload.sub_frame_crops,
+        payload.dynamic_img.width(),
+        payload.dynamic_img.height(),
+        payload.luma_image.width,
+        payload.luma_image.height,
+        &shifts,
+    )?;
 
     payload.item.set_luma_image(payload.luma_image);
     payload.item.set_features(features);
@@ -758,23 +788,8 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
     })
 }
 
-/// Stage 3: In-memory NeuQuant color quantization, GIF byte serialization, and optional MP4 video encoding.
+/// Stage 3: In-memory NeuQuant color quantization and GIF byte serialization, or MP4 video encoding.
 fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<EncodedStagePayload> {
-    let gif_output = if let Some(ref aligned_frames) = payload.aligned_frames {
-        let gif_path = payload
-            .output_dir
-            .join(format!("{}_wiggle.gif", payload.file_stem));
-        let mut gif_bytes = Vec::new();
-        crate::gif::WiggleGifBuilder::build_wiggle_gif(
-            aligned_frames,
-            &payload.item.gif_config(),
-            &mut gif_bytes,
-        )?;
-        Some((gif_path, gif_bytes))
-    } else {
-        None
-    };
-
     let video_output = if let (Some(ref aligned_frames), Some(video_cfg)) =
         (&payload.aligned_frames, payload.item.video_config())
     {
@@ -788,6 +803,25 @@ fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<Encoded
             &mut video_bytes,
         )?;
         Some((video_path, video_bytes))
+    } else {
+        None
+    };
+
+    let gif_output = if video_output.is_none() {
+        if let Some(ref aligned_frames) = payload.aligned_frames {
+            let gif_path = payload
+                .output_dir
+                .join(format!("{}_wiggle.gif", payload.file_stem));
+            let mut gif_bytes = Vec::new();
+            crate::gif::WiggleGifBuilder::build_wiggle_gif(
+                aligned_frames,
+                &payload.item.gif_config(),
+                &mut gif_bytes,
+            )?;
+            Some((gif_path, gif_bytes))
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -851,9 +885,9 @@ pub fn process_single_image(
 ) -> Result<FrameRoiSet> {
     let item = ImageItemContext::new(file_path.to_path_buf(), output_dir.to_path_buf());
     let mut processed = process_item(item, config)?;
-    processed.take_rois().ok_or_else(|| {
-        crate::error::Error::Unknown("Missing RoI results in processed context".to_string())
-    })
+    processed
+        .take_rois()
+        .ok_or_else(|| Error::Unknown("Missing RoI results in processed context".to_string()))
 }
 
 /// Drives processing for a verified batch of image files.
@@ -867,7 +901,155 @@ pub fn process_single_image(
 ///
 /// # Errors
 /// Returns [`Error::Io`] if output directory creation fails.
-#[allow(clippy::too_many_lines)]
+type Stage1Result =
+    std::result::Result<(usize, String, VisionStagePayload), (usize, String, Error)>;
+type Stage2Result =
+    std::result::Result<(usize, String, AlignedStagePayload), (usize, String, Error)>;
+type Stage3Result =
+    std::result::Result<(usize, String, EncodedStagePayload), (usize, String, Error)>;
+
+fn spawn_ingestion_stage(
+    items: Vec<ImageItemContext>,
+    config: RoiDetectionConfig,
+    observer: Option<std::sync::Arc<dyn ProgressObserver>>,
+    tx: crossbeam_channel::Sender<Stage1Result>,
+) {
+    let total = items.len();
+    std::thread::spawn(move || {
+        for (idx, item) in items.into_iter().enumerate() {
+            let file_stem = item.file_stem().to_string();
+            if let Some(ref obs) = observer {
+                obs.on_progress(ProgressEvent::ItemStarted {
+                    file_stem: &file_stem,
+                    index: idx + 1,
+                    total,
+                });
+            }
+
+            let result = stage_decode_and_roi(item, &config)
+                .map(|payload| (idx + 1, file_stem.clone(), payload))
+                .map_err(|e| (idx + 1, file_stem, e));
+
+            if tx.send(result).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+fn spawn_vision_workers(
+    rx: &crossbeam_channel::Receiver<Stage1Result>,
+    tx: &crossbeam_channel::Sender<Stage2Result>,
+    concurrency_limit: usize,
+) {
+    for _ in 0..concurrency_limit {
+        let rx_worker = rx.clone();
+        let tx_worker = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx_worker.recv() {
+                let result = match msg {
+                    Ok((idx, stem, payload)) => match stage_vision_and_align(payload) {
+                        Ok(aligned) => Ok((idx, stem, aligned)),
+                        Err(e) => Err((idx, stem, e)),
+                    },
+                    Err(err) => Err(err),
+                };
+                if tx_worker.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn spawn_encoding_workers(
+    rx: &crossbeam_channel::Receiver<Stage2Result>,
+    tx: &crossbeam_channel::Sender<Stage3Result>,
+    concurrency_limit: usize,
+) {
+    for _ in 0..concurrency_limit {
+        let rx_worker = rx.clone();
+        let tx_worker = tx.clone();
+        std::thread::spawn(move || {
+            while let Ok(msg) = rx_worker.recv() {
+                let result = match msg {
+                    Ok((idx, stem, payload)) => match stage_quantize_and_encode(payload) {
+                        Ok(encoded) => Ok((idx, stem, encoded)),
+                        Err(e) => Err((idx, stem, e)),
+                    },
+                    Err(err) => Err(err),
+                };
+                if tx_worker.send(result).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+}
+
+fn drain_and_write_outputs(
+    rx: &crossbeam_channel::Receiver<Stage3Result>,
+    total: usize,
+    observer: Option<&std::sync::Arc<dyn ProgressObserver>>,
+) -> (usize, usize) {
+    let mut successful_count = 0;
+    let mut failed_count = 0;
+
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Ok((idx, stem, payload)) => match stage_write_output(payload) {
+                Ok(_) => {
+                    if let Some(obs) = observer {
+                        obs.on_progress(ProgressEvent::ItemCompleted {
+                            file_stem: &stem,
+                            index: idx,
+                            total,
+                            success: true,
+                        });
+                    }
+                    successful_count += 1;
+                }
+                Err(e) => {
+                    tracing::error!(file = %stem, error = ?e, "Failed writing output files");
+                    if let Some(obs) = observer {
+                        obs.on_progress(ProgressEvent::ItemCompleted {
+                            file_stem: &stem,
+                            index: idx,
+                            total,
+                            success: false,
+                        });
+                    }
+                    failed_count += 1;
+                }
+            },
+            Err((idx, stem, err)) => {
+                tracing::error!(file = %stem, error = ?err, "Failed processing image");
+                if let Some(obs) = observer {
+                    obs.on_progress(ProgressEvent::ItemCompleted {
+                        file_stem: &stem,
+                        index: idx,
+                        total,
+                        success: false,
+                    });
+                }
+                failed_count += 1;
+            }
+        }
+    }
+    (successful_count, failed_count)
+}
+
+/// Drives processing for a verified batch of image files.
+///
+/// Executes per-item processing via a 4-stage pipelined streaming dataflow with bounded
+/// channel backpressure to overlap disk I/O, neural inference, and color quantization.
+/// Assumes file list verification has already been conducted by the front-end.
+///
+/// # Arguments
+/// * `request` - Batch processing specifications including files, destination, and debug flags.
+///
+/// # Errors
+/// Returns [`Error`] if output directory creation fails or an encoder cannot be initialized.
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     if request.files.is_empty() {
@@ -883,7 +1065,7 @@ pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     // Early pre-flight availability check for MP4 video encoder backend if video export is requested
     if let Some(ref video_cfg) = request.video_config() {
         let backend = crate::video::probe_video_encoder_backend(video_cfg).map_err(|e| {
-            crate::error::Error::Unknown(format!(
+            Error::Unknown(format!(
                 "MP4 video export requested, but no available HEVC video encoder backend was found on this host: {e}"
             ))
         })?;
@@ -905,118 +1087,14 @@ pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
     let (tx_aligned, rx_aligned) = crossbeam_channel::bounded(concurrency_limit);
     let (tx_encoded, rx_encoded) = crossbeam_channel::bounded(concurrency_limit);
 
-    // Stage 1: File Ingestion & Reader
-    let items_for_ingest = items;
-    let config_clone = config;
-    let observer_start = request.progress_observer.clone();
-    std::thread::spawn(move || {
-        for (idx, item) in items_for_ingest.into_iter().enumerate() {
-            let file_stem = item.file_stem().to_string();
-            if let Some(ref observer) = observer_start {
-                observer.on_progress(ProgressEvent::ItemStarted {
-                    file_stem: &file_stem,
-                    index: idx + 1,
-                    total,
-                });
-            }
+    spawn_ingestion_stage(items, config, request.progress_observer.clone(), tx_vision);
+    spawn_vision_workers(&rx_vision, &tx_aligned, concurrency_limit);
+    drop(tx_aligned);
+    spawn_encoding_workers(&rx_aligned, &tx_encoded, concurrency_limit);
+    drop(tx_encoded);
 
-            let result = stage_decode_and_roi(item, &config_clone)
-                .map(|payload| (idx + 1, file_stem.clone(), payload))
-                .map_err(|e| (idx + 1, file_stem, e));
-
-            if tx_vision.send(result).is_err() {
-                break;
-            }
-        }
-    });
-
-    // Stage 2: Vision & Neural Alignment Workers (Dedicated Threads)
-    for _ in 0..concurrency_limit {
-        let rx = rx_vision.clone();
-        let tx = tx_aligned.clone();
-        std::thread::spawn(move || {
-            while let Ok(msg) = rx.recv() {
-                let result = match msg {
-                    Ok((idx, stem, payload)) => match stage_vision_and_align(payload) {
-                        Ok(aligned) => Ok((idx, stem, aligned)),
-                        Err(e) => Err((idx, stem, e)),
-                    },
-                    Err(err) => Err(err),
-                };
-                if tx.send(result).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(tx_aligned); // Drop orchestrator sender so channel closes when workers finish
-
-    // Stage 3: Quantization & GIF Encoding Workers (Dedicated Threads)
-    for _ in 0..concurrency_limit {
-        let rx = rx_aligned.clone();
-        let tx = tx_encoded.clone();
-        std::thread::spawn(move || {
-            while let Ok(msg) = rx.recv() {
-                let result = match msg {
-                    Ok((idx, stem, payload)) => match stage_quantize_and_encode(payload) {
-                        Ok(encoded) => Ok((idx, stem, encoded)),
-                        Err(e) => Err((idx, stem, e)),
-                    },
-                    Err(err) => Err(err),
-                };
-                if tx.send(result).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    drop(tx_encoded); // Drop orchestrator sender so channel closes when workers finish
-
-    // Stage 4: Background File Writer & Progress Collector (Current Thread)
-    let mut successful_count = 0;
-    let mut failed_count = 0;
-
-    while let Ok(msg) = rx_encoded.recv() {
-        match msg {
-            Ok((idx, stem, payload)) => match stage_write_output(payload) {
-                Ok(_) => {
-                    if let Some(ref observer) = request.progress_observer {
-                        observer.on_progress(ProgressEvent::ItemCompleted {
-                            file_stem: &stem,
-                            index: idx,
-                            total,
-                            success: true,
-                        });
-                    }
-                    successful_count += 1;
-                }
-                Err(e) => {
-                    tracing::error!(file = %stem, error = ?e, "Failed writing output files");
-                    if let Some(ref observer) = request.progress_observer {
-                        observer.on_progress(ProgressEvent::ItemCompleted {
-                            file_stem: &stem,
-                            index: idx,
-                            total,
-                            success: false,
-                        });
-                    }
-                    failed_count += 1;
-                }
-            },
-            Err((idx, stem, err)) => {
-                tracing::error!(file = %stem, error = ?err, "Failed processing image");
-                if let Some(ref observer) = request.progress_observer {
-                    observer.on_progress(ProgressEvent::ItemCompleted {
-                        file_stem: &stem,
-                        index: idx,
-                        total,
-                        success: false,
-                    });
-                }
-                failed_count += 1;
-            }
-        }
-    }
+    let (successful_count, failed_count) =
+        drain_and_write_outputs(&rx_encoded, total, request.progress_observer.as_ref());
 
     let summary = ProcessSummary {
         total_input,
@@ -1073,10 +1151,21 @@ mod tests {
 
         // Debug run: verify roi_overlay is saved when debug is enabled
         let request_debug =
-            BatchProcessingRequest::new(vec![input_path], output_path.clone(), true);
+            BatchProcessingRequest::new(vec![input_path.clone()], output_path.clone(), true);
         let summary_debug = run_batch(&request_debug).expect("Debug batch should run");
         assert_eq!(summary_debug.successful_count, 1);
         assert!(output_path.join("sample_strip_roi_overlay.png").exists());
+
+        // Video run: verify wiggle MP4 is saved and GIF is NOT saved when video config is enabled
+        let video_output_path = temp_dir.join("video_output");
+        let video_config = crate::video::WiggleVideoConfig::new().with_mock_fallback(true);
+        let request_video =
+            BatchProcessingRequest::new(vec![input_path], video_output_path.clone(), false)
+                .with_video_config(Some(video_config));
+        let summary_video = run_batch(&request_video).expect("Video batch should run");
+        assert_eq!(summary_video.successful_count, 1);
+        assert!(video_output_path.join("sample_strip_wiggle.mp4").exists());
+        assert!(!video_output_path.join("sample_strip_wiggle.gif").exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

@@ -320,183 +320,224 @@ impl WiggleVideoBuilder {
     ///
     /// # Errors
     /// Returns [`Error`] if frames list is empty, dimensions differ, or encoding fails.
-    #[allow(clippy::too_many_lines)]
     pub fn build_wiggle_video<W: Write>(
         frames: &[RgbaImage],
         config: &WiggleVideoConfig,
         writer: &mut W,
     ) -> Result<()> {
-        if frames.is_empty() {
-            return Err(Error::Unknown(
-                "No frames provided for Wiggle MP4 video".into(),
-            ));
-        }
-
-        let (width, height) = frames[0].dimensions();
-        for frame in frames {
-            if frame.dimensions() != (width, height) {
-                return Err(Error::Unknown(
-                    "All frames must have identical dimensions for video assembly".into(),
-                ));
-            }
-        }
-
-        // 1. Convert RGBA frames to YUV420p Planar buffers
-        let yuv_frames: Vec<Yuv420PlanarFrame> =
-            frames.iter().map(RgbaToYuv420Converter::convert).collect();
-
+        let yuv_frames = convert_frames_to_yuv(frames)?;
         let enc_width = yuv_frames[0].width;
         let enc_height = yuv_frames[0].height;
 
-        // 2. Select hardware/software encoder using unified probe interface
-        let backend = probe_video_encoder_backend(config)
-            .map_err(|e| Error::Unknown(format!("Hardware HEVC video encoder unavailable: {e}")))?;
+        let mut encoder = initialize_encoder(config, enc_width, enc_height)?;
+        let sequence = build_playback_sequence(frames.len(), config.loops);
+        let stream = encode_frame_samples(encoder.as_mut(), &yuv_frames, &sequence, config)?;
 
-        let mut encoder = create_hevc_encoder(backend);
-
-        // 3. Initialize encoder configuration
-        let encoder_cfg = HevcEncoderConfig {
-            width: enc_width,
-            height: enc_height,
-            fps: 10, // Nominal FPS for timebase
-            bit_depth: 8,
-            crf_or_bitrate: config.crf,
-            gop_size: 30,
-            timing_delays_ms: vec![config.delay_ms],
-        };
-
-        if let Err(e) = encoder.initialize(&encoder_cfg) {
-            if config.fallback_to_mock {
-                tracing::warn!(error = %e, "Hardware video encoder failed on target resolution; falling back to software mock");
-                encoder = Box::new(SoftwareMockHevcEncoder::new());
-                encoder
-                    .initialize(&encoder_cfg)
-                    .map_err(|err| Error::Unknown(err.to_string()))?;
-            } else {
-                return Err(Error::Unknown(format!(
-                    "Failed to initialize HEVC video encoder ({backend}): {e}"
-                )));
-            }
-        }
-
-        // 4. Construct ping-pong loop index sequence
-        let single_loop_indices: Vec<usize> = if frames.len() == 3 {
-            vec![0, 1, 2, 1]
-        } else if frames.len() == 2 {
-            vec![0, 1]
-        } else {
-            (0..frames.len()).collect()
-        };
-
-        let loops_count = config.loops.max(1);
-        let mut full_sequence_indices = Vec::with_capacity(single_loop_indices.len() * loops_count);
-        for _ in 0..loops_count {
-            full_sequence_indices.extend_from_slice(&single_loop_indices);
-        }
-
-        // 5. Calculate per-frame display durations (preserving SE(3) non-uniform timings)
-        let get_frame_duration = |step_idx: usize, frame_idx: usize| -> u32 {
-            if let Some([d01, d12]) = config.adaptive_delays_ms {
-                if frames.len() == 3 {
-                    let seq_pos = step_idx % 4;
-                    match seq_pos {
-                        0 | 3 => d01,
-                        1 | 2 => d12,
-                        _ => config.delay_ms,
-                    }
-                } else {
-                    config.delay_ms
-                }
-            } else {
-                let _ = frame_idx;
-                config.delay_ms
-            }
-        };
-
-        // 6. Encode video frames and collect NAL units
-        let mut vps_data = Vec::new();
-        let mut sps_data = Vec::new();
-        let mut pps_data = Vec::new();
-        let mut video_samples = Vec::with_capacity(full_sequence_indices.len());
-
-        for (step_idx, &frame_idx) in full_sequence_indices.iter().enumerate() {
-            let is_keyframe = step_idx == 0;
-            let yuv_frame = &yuv_frames[frame_idx];
-            let nalus = encoder
-                .encode_frame(yuv_frame, is_keyframe)
-                .map_err(|e| Error::Unknown(e.to_string()))?;
-
-            let mut sample_nalus = Vec::new();
-            for nalu in nalus {
-                match nalu.nal_type {
-                    mp4_muxer::NAL_VPS => vps_data = nalu.data,
-                    mp4_muxer::NAL_SPS => sps_data = nalu.data,
-                    mp4_muxer::NAL_PPS => pps_data = nalu.data,
-                    _ => sample_nalus.push(nalu),
-                }
-            }
-
-            let dur_ms = get_frame_duration(step_idx, frame_idx);
-            video_samples.push(EncodedVideoSample {
-                nalus: sample_nalus,
-                duration_ms: dur_ms,
-                is_sync: is_keyframe,
-            });
-        }
-
-        let flushed = encoder.flush().map_err(|e| Error::Unknown(e.to_string()))?;
-        for nalu in flushed {
-            match nalu.nal_type {
-                mp4_muxer::NAL_VPS => vps_data = nalu.data,
-                mp4_muxer::NAL_SPS => sps_data = nalu.data,
-                mp4_muxer::NAL_PPS => pps_data = nalu.data,
-                _ => {
-                    if let Some(last_sample) = video_samples.last_mut() {
-                        last_sample.nalus.push(nalu);
-                    }
-                }
-            }
-        }
-
-        // Fallback parameter sets if encoder emitted in-band only
-        if vps_data.is_empty() {
-            vps_data = vec![
-                0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
-                0x00, 0x00, 0x03, 0x00, 0x00, 0x78, 0xAC, 0x09,
-            ];
-        }
-        if sps_data.is_empty() {
-            sps_data = vec![
-                0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03,
-                0x00, 0x00, 0x78, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16, 0x59, 0x5E, 0x49, 0x2B, 0x01,
-                0x01, 0x01, 0x40,
-            ];
-        }
-        if pps_data.is_empty() {
-            pps_data = vec![0x44, 0x01, 0xC0, 0xF3, 0xC0];
-        }
-
-        // 7. Mux into pure Rust ISO BMFF MP4 container
         Mp4Muxer::mux_hevc(
             enc_width,
             enc_height,
-            &vps_data,
-            &sps_data,
-            &pps_data,
-            &video_samples,
+            &stream.vps,
+            &stream.sps,
+            &stream.pps,
+            &stream.samples,
             writer,
         )?;
 
         tracing::info!(
             width = enc_width,
             height = enc_height,
-            loops = loops_count,
-            total_samples = video_samples.len(),
+            loops = config.loops.max(1),
+            total_samples = stream.samples.len(),
             "Encoded and multiplexed 24-bit TrueColor HEVC MP4 video successfully"
         );
 
         Ok(())
     }
+}
+
+/// Fallback HEVC Video Parameter Set (VPS) when omitted by encoder.
+const DEFAULT_FALLBACK_VPS: &[u8] = &[
+    0x40, 0x01, 0x0C, 0x01, 0xFF, 0xFF, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x03, 0x00, 0x00, 0x78, 0xAC, 0x09,
+];
+
+/// Fallback HEVC Sequence Parameter Set (SPS) when omitted by encoder.
+const DEFAULT_FALLBACK_SPS: &[u8] = &[
+    0x42, 0x01, 0x01, 0x01, 0x60, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00, 0x03, 0x00, 0x00,
+    0x78, 0xA0, 0x02, 0x80, 0x80, 0x2D, 0x16, 0x59, 0x5E, 0x49, 0x2B, 0x01, 0x01, 0x01, 0x40,
+];
+
+/// Fallback HEVC Picture Parameter Set (PPS) when omitted by encoder.
+const DEFAULT_FALLBACK_PPS: &[u8] = &[0x44, 0x01, 0xC0, 0xF3, 0xC0];
+
+/// Validate frame inputs and convert them to planar YUV420 buffers.
+fn convert_frames_to_yuv(frames: &[RgbaImage]) -> Result<Vec<Yuv420PlanarFrame>> {
+    if frames.is_empty() {
+        return Err(Error::Unknown(
+            "No frames provided for Wiggle MP4 video".into(),
+        ));
+    }
+
+    let (width, height) = frames[0].dimensions();
+    for frame in frames {
+        if frame.dimensions() != (width, height) {
+            return Err(Error::Unknown(
+                "All frames must have identical dimensions for video assembly".into(),
+            ));
+        }
+    }
+
+    Ok(frames.iter().map(RgbaToYuv420Converter::convert).collect())
+}
+
+/// Initialize the hardware or software fallback video encoder.
+fn initialize_encoder(
+    config: &WiggleVideoConfig,
+    enc_width: u32,
+    enc_height: u32,
+) -> Result<Box<dyn HevcFrameEncoder>> {
+    let backend = probe_video_encoder_backend(config)
+        .map_err(|e| Error::Unknown(format!("Hardware HEVC video encoder unavailable: {e}")))?;
+
+    let mut encoder = create_hevc_encoder(backend);
+    let encoder_cfg = HevcEncoderConfig {
+        width: enc_width,
+        height: enc_height,
+        fps: 10,
+        bit_depth: 8,
+        crf_or_bitrate: config.crf,
+        gop_size: 30,
+        timing_delays_ms: vec![config.delay_ms],
+    };
+
+    if let Err(e) = encoder.initialize(&encoder_cfg) {
+        if config.fallback_to_mock {
+            tracing::warn!(error = %e, "Hardware video encoder failed on target resolution; falling back to software mock");
+            encoder = Box::new(SoftwareMockHevcEncoder::new());
+            encoder
+                .initialize(&encoder_cfg)
+                .map_err(|err| Error::Unknown(err.to_string()))?;
+        } else {
+            return Err(Error::Unknown(format!(
+                "Failed to initialize HEVC video encoder ({backend}): {e}"
+            )));
+        }
+    }
+    Ok(encoder)
+}
+
+/// Build playback sequence indices based on ping-pong looping.
+fn build_playback_sequence(num_frames: usize, loops: usize) -> Vec<usize> {
+    let single_loop_indices: Vec<usize> = match num_frames {
+        3 => vec![0, 1, 2, 1],
+        2 => vec![0, 1],
+        n => (0..n).collect(),
+    };
+
+    let loops_count = loops.max(1);
+    let mut sequence = Vec::with_capacity(single_loop_indices.len() * loops_count);
+    for _ in 0..loops_count {
+        sequence.extend_from_slice(&single_loop_indices);
+    }
+    sequence
+}
+
+/// Calculate duration in milliseconds for a sequence step.
+const fn calculate_frame_duration(
+    step_idx: usize,
+    num_frames: usize,
+    config: &WiggleVideoConfig,
+) -> u32 {
+    if let Some([d01, d12]) = config.adaptive_delays_ms {
+        if num_frames == 3 {
+            match step_idx % 4 {
+                0 | 3 => d01,
+                1 | 2 => d12,
+                _ => config.delay_ms,
+            }
+        } else {
+            config.delay_ms
+        }
+    } else {
+        config.delay_ms
+    }
+}
+
+/// Extracted parameter sets and encoded video samples.
+struct EncodedVideoStream {
+    vps: Vec<u8>,
+    sps: Vec<u8>,
+    pps: Vec<u8>,
+    samples: Vec<EncodedVideoSample>,
+}
+
+/// Encode frames into video samples and extract header parameter sets.
+fn encode_frame_samples(
+    encoder: &mut dyn HevcFrameEncoder,
+    yuv_frames: &[Yuv420PlanarFrame],
+    sequence_indices: &[usize],
+    config: &WiggleVideoConfig,
+) -> Result<EncodedVideoStream> {
+    let mut vps = Vec::new();
+    let mut sps = Vec::new();
+    let mut pps = Vec::new();
+    let mut samples = Vec::with_capacity(sequence_indices.len());
+
+    for (step_idx, &frame_idx) in sequence_indices.iter().enumerate() {
+        let is_keyframe = step_idx == 0;
+        let yuv_frame = &yuv_frames[frame_idx];
+        let nalus = encoder
+            .encode_frame(yuv_frame, is_keyframe)
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let mut sample_nalus = Vec::new();
+        for nalu in nalus {
+            match nalu.nal_type {
+                mp4_muxer::NAL_VPS => vps = nalu.data,
+                mp4_muxer::NAL_SPS => sps = nalu.data,
+                mp4_muxer::NAL_PPS => pps = nalu.data,
+                _ => sample_nalus.push(nalu),
+            }
+        }
+
+        let dur_ms = calculate_frame_duration(step_idx, yuv_frames.len(), config);
+        samples.push(EncodedVideoSample {
+            nalus: sample_nalus,
+            duration_ms: dur_ms,
+            is_sync: is_keyframe,
+        });
+    }
+
+    let flushed = encoder.flush().map_err(|e| Error::Unknown(e.to_string()))?;
+    for nalu in flushed {
+        match nalu.nal_type {
+            mp4_muxer::NAL_VPS => vps = nalu.data,
+            mp4_muxer::NAL_SPS => sps = nalu.data,
+            mp4_muxer::NAL_PPS => pps = nalu.data,
+            _ => {
+                if let Some(last_sample) = samples.last_mut() {
+                    last_sample.nalus.push(nalu);
+                }
+            }
+        }
+    }
+
+    if vps.is_empty() {
+        vps = DEFAULT_FALLBACK_VPS.to_vec();
+    }
+    if sps.is_empty() {
+        sps = DEFAULT_FALLBACK_SPS.to_vec();
+    }
+    if pps.is_empty() {
+        pps = DEFAULT_FALLBACK_PPS.to_vec();
+    }
+
+    Ok(EncodedVideoStream {
+        vps,
+        sps,
+        pps,
+        samples,
+    })
 }
 
 #[cfg(test)]
