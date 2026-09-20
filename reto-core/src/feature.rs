@@ -522,6 +522,35 @@ impl BackendDevice {
     }
 }
 
+/// Status of localized sub-pixel gradient tensor refinement for a keypoint.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub enum SubpixelStatus {
+    /// Initial neural coordinate without refinement attempt.
+    #[default]
+    NeuralOnly,
+    /// Successfully converged to a sub-pixel location.
+    Refined {
+        /// Sub-pixel displacement vector (dx, dy) in pixels.
+        delta: (f32, f32),
+        /// Number of gradient descent iterations performed.
+        iterations: usize,
+    },
+    /// Sub-pixel refinement exceeded maximum drift threshold; reverted to neural coordinate.
+    DriftRejected {
+        /// Attempted displacement magnitude in pixels that caused rejection.
+        drift_px: f32,
+    },
+    /// Structure tensor was ill-conditioned (1D aperture edge or low texture); skipped refinement.
+    PoorConditioning {
+        /// Minimum eigenvalue of the spatial structure tensor.
+        min_eigenvalue: f32,
+        /// Conditioning ratio lambda_min / lambda_max.
+        cond_ratio: f32,
+    },
+    /// Keypoint lies too close to image boundary to extract full patch.
+    BoundarySkipped,
+}
+
 /// A 2D feature keypoint with sub-pixel coordinates, confidence score, and optional descriptor vector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KeyPoint {
@@ -531,6 +560,8 @@ pub struct KeyPoint {
     pub score: f32,
     /// High-dimensional descriptor vector (e.g. 256 dimensions for `SuperPoint`).
     pub descriptor: Option<Vec<f32>>,
+    /// Status and metadata of localized sub-pixel gradient refinement.
+    pub subpixel_status: SubpixelStatus,
 }
 
 impl KeyPoint {
@@ -542,6 +573,24 @@ impl KeyPoint {
             point,
             score,
             descriptor,
+            subpixel_status: SubpixelStatus::NeuralOnly,
+        }
+    }
+
+    /// Constructs a new `KeyPoint` with explicit sub-pixel refinement status.
+    #[inline]
+    #[must_use]
+    pub const fn with_subpixel_status(
+        point: Point2D<f32>,
+        score: f32,
+        descriptor: Option<Vec<f32>>,
+        subpixel_status: SubpixelStatus,
+    ) -> Self {
+        Self {
+            point,
+            score,
+            descriptor,
+            subpixel_status,
         }
     }
 }
@@ -591,7 +640,42 @@ impl FeatureFrame {
     }
 }
 
-/// Match correspondence between two keypoint indices.
+/// Detailed descriptor matching score and geometric agreement metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MatchScore {
+    /// Raw descriptor cosine similarity / correlation score in `[-1.0, 1.0]`.
+    pub similarity: f32,
+    /// Normalized matching confidence score in `[0.0, 1.0]`.
+    pub confidence: f32,
+    /// Nearest neighbor distance ratio (Lowe's ratio test: d1 / d2), if computed.
+    pub distance_ratio: Option<f32>,
+}
+
+impl MatchScore {
+    /// Constructs a `MatchScore` from a normalized confidence score.
+    #[inline]
+    #[must_use]
+    pub const fn from_confidence(confidence: f32) -> Self {
+        Self {
+            similarity: confidence,
+            confidence,
+            distance_ratio: None,
+        }
+    }
+
+    /// Constructs a detailed `MatchScore` with similarity and distance ratio.
+    #[inline]
+    #[must_use]
+    pub const fn new(similarity: f32, confidence: f32, distance_ratio: Option<f32>) -> Self {
+        Self {
+            similarity,
+            confidence,
+            distance_ratio,
+        }
+    }
+}
+
+/// Match correspondence between two keypoint indices with structured confidence.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FeatureMatch {
     /// Index of the keypoint in frame A.
@@ -600,6 +684,8 @@ pub struct FeatureMatch {
     pub index_b: usize,
     /// Matching confidence or similarity score.
     pub confidence: f32,
+    /// Detailed matching score metadata.
+    pub score: MatchScore,
 }
 
 impl FeatureMatch {
@@ -611,6 +697,19 @@ impl FeatureMatch {
             index_a,
             index_b,
             confidence,
+            score: MatchScore::from_confidence(confidence),
+        }
+    }
+
+    /// Constructs a `FeatureMatch` with detailed `MatchScore`.
+    #[inline]
+    #[must_use]
+    pub const fn with_score(index_a: usize, index_b: usize, score: MatchScore) -> Self {
+        Self {
+            index_a,
+            index_b,
+            confidence: score.confidence,
+            score,
         }
     }
 }
@@ -725,6 +824,8 @@ pub struct TripletConsistencyConfig {
     pub max_cascade_error_px: f32,
     /// Minimum disparity in pixels to avoid division by zero on points at optical infinity.
     pub min_disparity_px: f32,
+    /// Radial boundary slack scaling factor for outer image regions (e.g. 1.5 relaxes tolerance up to 2.5x at corners).
+    pub radial_slack_factor: f32,
     /// Strip orientation (horizontal vs vertical frame layout).
     pub orientation: StripOrientation,
 }
@@ -737,6 +838,7 @@ impl Default for TripletConsistencyConfig {
             max_cross_baseline_jitter_px: 25.0,
             max_cascade_error_px: 5.0,
             min_disparity_px: 0.1,
+            radial_slack_factor: 1.5,
             orientation: StripOrientation::Horizontal,
         }
     }
@@ -753,6 +855,7 @@ impl TripletConsistencyConfig {
             max_cross_baseline_jitter_px: 25.0,
             max_cascade_error_px: 5.0,
             min_disparity_px: 0.1,
+            radial_slack_factor: 1.5,
             orientation,
         }
     }
@@ -766,6 +869,7 @@ impl TripletConsistencyConfig {
     ///
     /// # Returns
     /// `Some((disparity_01, disparity_12, cascade_error))` if inlier, else `None`.
+    #[inline]
     #[must_use]
     pub fn verify_triplet(
         &self,
@@ -773,32 +877,74 @@ impl TripletConsistencyConfig {
         pt1: Point2D<f32>,
         pt2: Point2D<f32>,
     ) -> Option<(f32, f32, f32)> {
+        self.verify_triplet_with_bounds(pt0, pt1, pt2, None)
+    }
+
+    /// Verifies if a candidate feature triplet satisfies the rigid cascaded transform boundary condition,
+    /// with optional radius-dependent boundary slack expansion for uncalibrated wide-angle distortion.
+    ///
+    /// # Arguments
+    /// * `pt0` - 2D coordinate in Frame 0.
+    /// * `pt1` - 2D coordinate in Frame 1.
+    /// * `pt2` - 2D coordinate in Frame 2.
+    /// * `frame_size` - Optional dimensions of the sub-frame to compute normalized radius.
+    ///
+    /// # Returns
+    /// `Some((disparity_01, disparity_12, cascade_error))` if inlier, else `None`.
+    #[must_use]
+    #[allow(clippy::suboptimal_flops, clippy::cast_precision_loss)]
+    pub fn verify_triplet_with_bounds(
+        &self,
+        pt0: Point2D<f32>,
+        pt1: Point2D<f32>,
+        pt2: Point2D<f32>,
+        frame_size: Option<Size2D<u32>>,
+    ) -> Option<(f32, f32, f32)> {
         // Project onto baseline axis (parallax) and orthogonal cross-baseline axis (epipolar jitter)
         let (p0_base, p0_cross, p1_base, p1_cross, p2_base, p2_cross) = match self.orientation {
             StripOrientation::Horizontal => (pt0.x, pt0.y, pt1.x, pt1.y, pt2.x, pt2.y),
             StripOrientation::Vertical => (pt0.y, pt0.x, pt1.y, pt1.x, pt2.y, pt2.x),
         };
 
+        // Compute radial boundary slack multiplier if frame size is provided
+        let slack = frame_size.map_or(1.0_f32, |sz| {
+            let cx = sz.width as f32 * 0.5;
+            let cy = sz.height as f32 * 0.5;
+            let r_max_sq = cx * cx + cy * cy;
+            if r_max_sq > 1e-3 {
+                let dx = pt0.x - cx;
+                let dy = pt0.y - cy;
+                let r_norm_sq = (dx * dx + dy * dy) / r_max_sq;
+                1.0 + self.radial_slack_factor * r_norm_sq.min(1.0)
+            } else {
+                1.0
+            }
+        });
+
+        let eff_max_cross_jitter = self.max_cross_baseline_jitter_px * slack;
+        let eff_max_cascade_err = self.max_cascade_error_px * slack;
+
         // 1. Cross-baseline jitter bound across all view pairs
         let d_cross_01 = (p0_cross - p1_cross).abs();
         let d_cross_12 = (p1_cross - p2_cross).abs();
         let d_cross_02 = (p0_cross - p2_cross).abs();
-        if d_cross_01 > self.max_cross_baseline_jitter_px
-            || d_cross_12 > self.max_cross_baseline_jitter_px
-            || d_cross_02 > self.max_cross_baseline_jitter_px
+        if d_cross_01 > eff_max_cross_jitter
+            || d_cross_12 > eff_max_cross_jitter
+            || d_cross_02 > eff_max_cross_jitter
         {
             return None;
         }
 
-        // 2. Collinear along-baseline disparity calculation
+        // 2. Collinear along-baseline disparity calculation across all 3 view combinations
         let raw_disp_01 = p0_base - p1_base;
         let raw_disp_12 = p1_base - p2_base;
         let raw_disp_02 = p0_base - p2_base;
 
         let disp_01 = raw_disp_01.abs();
         let disp_12 = raw_disp_12.abs();
+        let disp_02 = raw_disp_02.abs();
 
-        // Direction check: only enforce when disparity is well above unrectified mounting jitter
+        // Direction check across all pairs: enforce sign consistency when above unrectified mounting jitter
         let noise_floor = 4.0_f32;
         if disp_01 > noise_floor
             && disp_12 > noise_floor
@@ -806,14 +952,154 @@ impl TripletConsistencyConfig {
         {
             return None;
         }
+        if disp_02 > noise_floor
+            && disp_01 > noise_floor
+            && (raw_disp_02.signum() - raw_disp_01.signum()).abs() > 0.01
+        {
+            return None;
+        }
 
-        // 3. Cascaded transform additivity: T_02 = T_12 * T_01 => raw_disp_02 ≈ raw_disp_01 + raw_disp_12
-        let cascade_error = (raw_disp_02 - (raw_disp_01 + raw_disp_12)).abs();
-        if cascade_error > self.max_cascade_error_px {
+        // 3. Disparity ratio consistency check across baselines
+        if disp_01 >= self.min_disparity_px && disp_12 >= self.min_disparity_px {
+            let ratio = disp_01 / disp_12;
+            let ratio_dev = (ratio - self.baseline_ratio).abs() / self.baseline_ratio;
+            if ratio_dev > self.max_disparity_ratio_deviation {
+                return None;
+            }
+        }
+
+        // 4. Cascaded baseline transform additivity & long-baseline anchor consistency
+        // Expected displacement on baseline 1-2 from baseline 0-1 scaled by baseline_ratio
+        let expected_raw_disp_12 = raw_disp_01 / self.baseline_ratio;
+        let cascade_error = (raw_disp_12 - expected_raw_disp_12).abs();
+        if cascade_error > eff_max_cascade_err {
             return None;
         }
 
         Some((disp_01, disp_12, cascade_error))
+    }
+}
+
+/// Estimated 6-DoF chassis extrinsics and multi-view geometric alignment properties across sub-frames.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChassisExtrinsics {
+    /// Relative translation from Frame 0 to Frame 1 `(along_baseline_dx, cross_baseline_dy)` in pixels.
+    pub translation_01: (f32, f32),
+    /// Relative translation from Frame 1 to Frame 2 `(along_baseline_dx, cross_baseline_dy)` in pixels.
+    pub translation_12: (f32, f32),
+    /// Relative translation from Frame 0 to Frame 2 `(along_baseline_dx, cross_baseline_dy)` in pixels.
+    pub translation_02: (f32, f32),
+    /// Physical vertical center sag in pixels (deviation of Center lens L1 from the L0-L2 chord).
+    pub center_sag_px: f32,
+    /// Measured empirical baseline ratio `|t_01| / |t_12|`.
+    pub empirical_baseline_ratio: f32,
+    /// Root-mean-square reprojection / disparity consistency error in pixels.
+    pub rmse_consistency_px: f32,
+    /// Number of verified triplet feature tracks used for estimation.
+    pub inlier_count: usize,
+}
+
+impl Default for ChassisExtrinsics {
+    fn default() -> Self {
+        Self {
+            translation_01: (0.0, 0.0),
+            translation_12: (0.0, 0.0),
+            translation_02: (0.0, 0.0),
+            center_sag_px: 0.0,
+            empirical_baseline_ratio: 1.0,
+            rmse_consistency_px: 0.0,
+            inlier_count: 0,
+        }
+    }
+}
+
+impl ChassisExtrinsics {
+    /// Estimates multi-lens chassis extrinsics and geometric offsets from verified feature triplets.
+    ///
+    /// # Arguments
+    /// * `triplets` - Slice of verified feature triplets.
+    /// * `frames` - Slice of feature frames corresponding to sub-views (0, 1, 2).
+    /// * `orientation` - Scan strip layout orientation.
+    ///
+    /// # Returns
+    /// Estimated `ChassisExtrinsics` geometry summary.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+    pub fn estimate_from_triplets(
+        triplets: &[FeatureTriplet],
+        frames: &[FeatureFrame],
+        orientation: StripOrientation,
+    ) -> Self {
+        if triplets.is_empty() || frames.len() < 3 {
+            return Self::default();
+        }
+
+        let mut d_base_01 = Vec::with_capacity(triplets.len());
+        let mut d_cross_01 = Vec::with_capacity(triplets.len());
+        let mut d_base_12 = Vec::with_capacity(triplets.len());
+        let mut d_cross_12 = Vec::with_capacity(triplets.len());
+        let mut d_base_02 = Vec::with_capacity(triplets.len());
+        let mut d_cross_02 = Vec::with_capacity(triplets.len());
+        let mut sum_sq_cascade = 0.0_f32;
+
+        for t in triplets {
+            let p0 = frames[0].keypoints[t.index_0].point;
+            let p1 = frames[1].keypoints[t.index_1].point;
+            let p2 = frames[2].keypoints[t.index_2].point;
+
+            let (p0_b, p0_c, p1_b, p1_c, p2_b, p2_c) = match orientation {
+                StripOrientation::Horizontal => (p0.x, p0.y, p1.x, p1.y, p2.x, p2.y),
+                StripOrientation::Vertical => (p0.y, p0.x, p1.y, p1.x, p2.y, p2.x),
+            };
+
+            d_base_01.push(p0_b - p1_b);
+            d_cross_01.push(p1_c - p0_c);
+            d_base_12.push(p1_b - p2_b);
+            d_cross_12.push(p2_c - p1_c);
+            d_base_02.push(p0_b - p2_b);
+            d_cross_02.push(p2_c - p0_c);
+            sum_sq_cascade += t.cascade_error * t.cascade_error;
+        }
+
+        let med_base_01 = compute_median(&mut d_base_01);
+        let med_cross_01 = compute_median(&mut d_cross_01);
+        let med_base_12 = compute_median(&mut d_base_12);
+        let med_cross_12 = compute_median(&mut d_cross_12);
+        let med_base_02 = compute_median(&mut d_base_02);
+        let med_cross_02 = compute_median(&mut d_cross_02);
+
+        // Center lens sag relative to the chord connecting L0 and L2
+        let center_sag_px = med_cross_01 - 0.5 * med_cross_02;
+        let empirical_baseline_ratio = if med_base_12.abs() > 1e-4 {
+            med_base_01 / med_base_12
+        } else {
+            1.0
+        };
+        let rmse_consistency_px = (sum_sq_cascade / triplets.len() as f32).sqrt();
+
+        Self {
+            translation_01: (med_base_01, med_cross_01),
+            translation_12: (med_base_12, med_cross_12),
+            translation_02: (med_base_02, med_cross_02),
+            center_sag_px,
+            empirical_baseline_ratio,
+            rmse_consistency_px,
+            inlier_count: triplets.len(),
+        }
+    }
+}
+
+#[inline]
+fn compute_median(values: &mut [f32]) -> f32 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        f32::midpoint(values[mid - 1], values[mid])
+    } else {
+        values[mid]
     }
 }
 
@@ -904,7 +1190,7 @@ pub trait FeatureMatcher: Send + Sync {
     ///
     /// # Errors
     /// Returns [`AlignmentError`] if frames count is less than 3 or pairwise matching fails.
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss, clippy::too_many_lines)]
     fn extract_consistent_triplets(
         &self,
         frames: &[FeatureFrame],
@@ -963,8 +1249,13 @@ pub trait FeatureMatcher: Send + Sync {
                     let k1 = &frames[1].keypoints[i1];
                     let k2 = &frames[2].keypoints[i2];
 
-                    if let Some((disp_01, disp_12, cascade_err)) =
-                        config.verify_triplet(k0.point, k1.point, k2.point)
+                    if let Some((disp_01, disp_12, cascade_err)) = config
+                        .verify_triplet_with_bounds(
+                            k0.point,
+                            k1.point,
+                            k2.point,
+                            Some(frames[0].image_size),
+                        )
                     {
                         // Geometric mean of 3-way matching confidence
                         let conf = (conf_01 * conf_12 * conf_02).cbrt();
@@ -1124,7 +1415,13 @@ impl FeatureMatcher for SuperPointDescriptorMatcher {
             };
 
             if best_sim >= self.min_similarity && passes_ratio {
-                matches.push(FeatureMatch::new(i_a, best_idx, best_sim));
+                let dist_ratio = if second_best_sim > 0.0 && (1.0 - second_best_sim).abs() > 1e-6 {
+                    Some((1.0 - best_sim) / (1.0 - second_best_sim))
+                } else {
+                    None
+                };
+                let score = MatchScore::new(best_sim, best_sim, dist_ratio);
+                matches.push(FeatureMatch::with_score(i_a, best_idx, score));
             }
         }
 
@@ -1207,6 +1504,8 @@ pub struct SuperPointConfig {
     pub subpixel_patch_radius: usize,
     /// Maximum iterations for sub-pixel refinement convergence (default: 5).
     pub subpixel_max_iterations: usize,
+    /// Maximum allowed drift in pixels from the initial keypoint coordinate before falling back (default: 2.5).
+    pub max_subpixel_drift_px: f32,
     /// Optional explicit path to `superpoint.onnx` model weights.
     pub model_path: Option<PathBuf>,
     /// Remote URL for downloading the model if missing from cache.
@@ -1246,6 +1545,7 @@ impl Default for SuperPointConfig {
             subpixel_refinement: true,
             subpixel_patch_radius: DEFAULT_SUBPIXEL_PATCH_RADIUS,
             subpixel_max_iterations: DEFAULT_SUBPIXEL_MAX_ITERATIONS,
+            max_subpixel_drift_px: DEFAULT_SUBPIXEL_MAX_DRIFT_PX,
             model_path: None,
             model_url: DEFAULT_SUPERPOINT_MODEL_URL.to_string(),
             expected_sha256: Some(DEFAULT_SUPERPOINT_MODEL_SHA256.to_string()),
@@ -1789,7 +2089,31 @@ pub const DEFAULT_SUBPIXEL_MAX_ITERATIONS: usize = 5;
 /// Default convergence displacement epsilon in pixels for sub-pixel keypoint refinement (0.01 px).
 pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
 
+/// Default maximum allowed sub-pixel drift in pixels from initial position before fallback (2.5 px).
+pub const DEFAULT_SUBPIXEL_MAX_DRIFT_PX: f32 = 2.5;
+
 /// Refines keypoint coordinates to sub-pixel accuracy using localized gradient-based photometric patch tracking (Förstner / Lucas-Kanade corner operator).
+///
+/// Delegates to [`refine_keypoints_subpixel_with_drift`] with [`DEFAULT_SUBPIXEL_MAX_DRIFT_PX`].
+#[inline]
+pub fn refine_keypoints_subpixel(
+    image: &image::GrayImage,
+    keypoints: &mut [KeyPoint],
+    radius: usize,
+    max_iterations: usize,
+    epsilon: f32,
+) {
+    refine_keypoints_subpixel_with_drift(
+        image,
+        keypoints,
+        radius,
+        max_iterations,
+        epsilon,
+        DEFAULT_SUBPIXEL_MAX_DRIFT_PX,
+    );
+}
+
+/// Refines keypoint coordinates to sub-pixel accuracy with a configurable maximum drift tolerance.
 ///
 /// For each keypoint detected on coarse or downscaled grids, this samples a full-resolution patch
 /// ($W \times W$ where $W = 2 \times \text{radius} + 1$) around the keypoint, evaluates spatial image gradients
@@ -1802,10 +2126,11 @@ pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
 /// * `radius` - Patch half-window radius in pixels (e.g. 7 for a 15x15 window).
 /// * `max_iterations` - Maximum refinement iterations (e.g. 5).
 /// * `epsilon` - Convergence displacement threshold in pixels (e.g. 0.01).
+/// * `max_drift_px` - Maximum allowed drift in pixels from the initial coordinate (e.g. 2.5).
 ///
 /// # Examples
 /// ```
-/// use reto_core::{refine_keypoints_subpixel, KeyPoint, Point2D};
+/// use reto_core::{refine_keypoints_subpixel_with_drift, KeyPoint, Point2D};
 /// use image::GrayImage;
 ///
 /// let mut img = GrayImage::new(32, 32);
@@ -1816,7 +2141,7 @@ pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
 /// }
 ///
 /// let mut kps = vec![KeyPoint::new(Point2D::new(15.2, 15.3), 0.95, None)];
-/// refine_keypoints_subpixel(&img, &mut kps, 5, 5, 0.01);
+/// refine_keypoints_subpixel_with_drift(&img, &mut kps, 5, 5, 0.01, 2.0);
 /// assert!(kps[0].point.x >= 14.0 && kps[0].point.x <= 16.5);
 /// ```
 #[allow(
@@ -1827,14 +2152,16 @@ pub const DEFAULT_SUBPIXEL_EPSILON_PX: f32 = 0.01;
     clippy::many_single_char_names,
     clippy::suboptimal_flops,
     clippy::similar_names,
-    clippy::suspicious_operation_groupings
+    clippy::suspicious_operation_groupings,
+    clippy::too_many_lines
 )]
-pub fn refine_keypoints_subpixel(
+pub fn refine_keypoints_subpixel_with_drift(
     image: &image::GrayImage,
     keypoints: &mut [KeyPoint],
     radius: usize,
     max_iterations: usize,
     epsilon: f32,
+    max_drift_px: f32,
 ) {
     let (width, height) = image.dimensions();
     let r = radius as isize;
@@ -1851,7 +2178,7 @@ pub fn refine_keypoints_subpixel(
     let inv_two_sigma_sq = 1.0 / two_sigma_sq;
     let eps_sq = epsilon * epsilon;
     let max_step_sq = 1.5_f32 * 1.5_f32;
-    let max_drift_sq = 2.5_f32 * 2.5_f32;
+    let max_drift_sq = max_drift_px * max_drift_px;
 
     let min_bound = (radius + 1) as f32;
     let max_bound_x = (width.saturating_sub(radius as u32 + 2)) as f32;
@@ -1865,13 +2192,17 @@ pub fn refine_keypoints_subpixel(
         // Check if initial keypoint is within safe margins
         if x_init < min_bound || x_init > max_bound_x || y_init < min_bound || y_init > max_bound_y
         {
+            kp.subpixel_status = SubpixelStatus::BoundarySkipped;
             return;
         }
 
         let mut x_curr = x_init;
         let mut y_curr = y_init;
+        let mut iters_done = 0;
+        let mut status = SubpixelStatus::NeuralOnly;
 
-        for _ in 0..max_iterations {
+        for iter in 0..max_iterations {
+            iters_done = iter + 1;
             let mut a = 0.0_f32; // sum w * Ix^2
             let mut b = 0.0_f32; // sum w * Ix * Iy
             let mut c = 0.0_f32; // sum w * Iy^2
@@ -1886,6 +2217,7 @@ pub fn refine_keypoints_subpixel(
                 || cy_round - r - 1 < 0
                 || cy_round + r + 1 >= height as isize
             {
+                status = SubpixelStatus::BoundarySkipped;
                 break;
             }
 
@@ -1928,12 +2260,28 @@ pub fn refine_keypoints_subpixel(
 
             // Structure tensor conditioning check (ensure non-degenerate 2D corner)
             if det < 1e-7 || tr < 1e-5 {
+                status = SubpixelStatus::PoorConditioning {
+                    min_eigenvalue: 0.0,
+                    cond_ratio: 0.0,
+                };
                 break;
             }
 
             let trace_sq_minus_4det = (tr * tr - 4.0 * det).max(0.0);
-            let lambda_min = 0.5 * (tr - trace_sq_minus_4det.sqrt());
-            if lambda_min < 1e-5 {
+            let sqrt_term = trace_sq_minus_4det.sqrt();
+            let lambda_min = 0.5 * (tr - sqrt_term);
+            let lambda_max = 0.5 * (tr + sqrt_term);
+            let cond_ratio = if lambda_max > 1e-6 {
+                lambda_min / lambda_max
+            } else {
+                0.0
+            };
+
+            if lambda_min < 1e-5 || cond_ratio < 0.05 {
+                status = SubpixelStatus::PoorConditioning {
+                    min_eigenvalue: lambda_min,
+                    cond_ratio,
+                };
                 break;
             }
 
@@ -1954,17 +2302,35 @@ pub fn refine_keypoints_subpixel(
                 (x_curr - x_init) * (x_curr - x_init) + (y_curr - y_init) * (y_curr - y_init);
             if drift_sq > max_drift_sq {
                 // Revert to initial if displacement wandered too far
+                let drift_px = drift_sq.sqrt();
                 x_curr = x_init;
                 y_curr = y_init;
+                status = SubpixelStatus::DriftRejected { drift_px };
                 break;
             }
 
             if step_norm_sq < eps_sq {
+                status = SubpixelStatus::Refined {
+                    delta: (x_curr - x_init, y_curr - y_init),
+                    iterations: iters_done,
+                };
                 break;
             }
         }
 
+        if status == SubpixelStatus::NeuralOnly {
+            let dx = x_curr - x_init;
+            let dy = y_curr - y_init;
+            if dx * dx + dy * dy > 1e-6 {
+                status = SubpixelStatus::Refined {
+                    delta: (dx, dy),
+                    iterations: iters_done,
+                };
+            }
+        }
+
         kp.point = Point2D::new(x_curr, y_curr);
+        kp.subpixel_status = status;
     });
 }
 
@@ -2082,12 +2448,13 @@ impl PointDetector for SuperPointDetector {
             match plan_res {
                 Ok(mut kps) => {
                     if self.config.subpixel_refinement {
-                        refine_keypoints_subpixel(
+                        refine_keypoints_subpixel_with_drift(
                             &gray_orig,
                             &mut kps,
                             self.config.subpixel_patch_radius,
                             self.config.subpixel_max_iterations,
                             DEFAULT_SUBPIXEL_EPSILON_PX,
+                            self.config.max_subpixel_drift_px,
                         );
                     }
                     return Ok(kps);
@@ -2130,12 +2497,13 @@ impl PointDetector for SuperPointDetector {
             .collect();
 
         if self.config.subpixel_refinement {
-            refine_keypoints_subpixel(
+            refine_keypoints_subpixel_with_drift(
                 &gray_orig,
                 &mut keypoints,
                 self.config.subpixel_patch_radius,
                 self.config.subpixel_max_iterations,
                 DEFAULT_SUBPIXEL_EPSILON_PX,
+                self.config.max_subpixel_drift_px,
             );
         }
 
@@ -2382,12 +2750,13 @@ impl PointDetector for SuperPointDetector {
             };
 
             if self.config.subpixel_refinement {
-                refine_keypoints_subpixel(
+                refine_keypoints_subpixel_with_drift(
                     &spec.orig_img,
                     &mut keypoints,
                     self.config.subpixel_patch_radius,
                     self.config.subpixel_max_iterations,
                     DEFAULT_SUBPIXEL_EPSILON_PX,
+                    self.config.max_subpixel_drift_px,
                 );
             }
 
@@ -2601,6 +2970,82 @@ mod tests {
         // 3. Outlier due to opposing disparity directions (forward vs reverse):
         let p1_opposing_disp = Point2D::new(120.0, 50.0);
         assert!(config.verify_triplet(p0, p1_opposing_disp, p2).is_none());
+
+        // 4. Outlier due to disparity ratio deviation exceeding tolerance:
+        let p2_ratio_outlier = Point2D::new(75.0, 50.0); // disp_01 = 20, disp_12 = 5 -> ratio = 4.0
+        assert!(config.verify_triplet(p0, p1, p2_ratio_outlier).is_none());
+    }
+
+    #[test]
+    fn test_chassis_extrinsics_estimation() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.33, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None),
+                KeyPoint::new(Point2D::new(200.0, 80.0), 0.9, None),
+            ],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(80.0, 52.0), 0.9, None),
+                KeyPoint::new(Point2D::new(180.0, 82.0), 0.9, None),
+            ],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None),
+                KeyPoint::new(Point2D::new(160.0, 80.0), 0.9, None),
+            ],
+        );
+
+        let triplets = vec![
+            FeatureTriplet {
+                index_0: 0,
+                index_1: 0,
+                index_2: 0,
+                confidence: 0.9,
+                disparity_01: 20.0,
+                disparity_12: 20.0,
+                cascade_error: 0.0,
+            },
+            FeatureTriplet {
+                index_0: 1,
+                index_1: 1,
+                index_2: 1,
+                confidence: 0.9,
+                disparity_01: 20.0,
+                disparity_12: 20.0,
+                cascade_error: 0.0,
+            },
+        ];
+
+        let frames = [f0, f1, f2];
+        let extrinsics = ChassisExtrinsics::estimate_from_triplets(
+            &triplets,
+            &frames,
+            StripOrientation::Horizontal,
+        );
+
+        assert_eq!(extrinsics.inlier_count, 2);
+        assert_eq!(extrinsics.translation_01.0, 20.0);
+        assert_eq!(extrinsics.translation_01.1, 2.0); // center frame dropped by 2px relative to frame 0
+        assert_eq!(extrinsics.translation_12.0, 20.0);
+        assert_eq!(extrinsics.translation_12.1, -2.0); // frame 2 moved up by 2px relative to frame 1
+        assert_eq!(extrinsics.translation_02.0, 40.0);
+        assert_eq!(extrinsics.translation_02.1, 0.0); // frame 0 and frame 2 collinear on Y
+        assert_eq!(extrinsics.center_sag_px, 2.0); // center sag is 2.0px
+        assert!((extrinsics.empirical_baseline_ratio - 1.0).abs() < 1e-4);
     }
 
     struct MockFeatureMatcher {
@@ -2739,6 +3184,10 @@ mod tests {
             "Refined Y {} is not within 0.05 of true corner 31.5",
             kps[0].point.y
         );
+        assert!(matches!(
+            kps[0].subpixel_status,
+            SubpixelStatus::Refined { .. }
+        ));
     }
 
     #[test]
@@ -2754,13 +3203,51 @@ mod tests {
 
         refine_keypoints_subpixel(&flat_img, &mut kps, 7, 5, 0.01);
 
-        // Flat region and border points should remain stable without drifting or NaN
+        // Flat region should report PoorConditioning and border points should report BoundarySkipped
         assert!((kps[0].point.x - 32.0).abs() < f32::EPSILON);
         assert!((kps[0].point.y - 32.0).abs() < f32::EPSILON);
+        assert!(matches!(
+            kps[0].subpixel_status,
+            SubpixelStatus::PoorConditioning { .. }
+        ));
+
         assert!((kps[1].point.x - 1.0).abs() < f32::EPSILON);
         assert!((kps[1].point.y - 1.0).abs() < f32::EPSILON);
+        assert_eq!(kps[1].subpixel_status, SubpixelStatus::BoundarySkipped);
+
         assert!((kps[2].point.x - 63.0).abs() < f32::EPSILON);
         assert!((kps[2].point.y - 63.0).abs() < f32::EPSILON);
+        assert_eq!(kps[2].subpixel_status, SubpixelStatus::BoundarySkipped);
+    }
+
+    #[test]
+    fn test_subpixel_refinement_drift_rejection() {
+        use image::GrayImage;
+
+        let mut img = GrayImage::new(64, 64);
+        for y in 0..64 {
+            for x in 0..64 {
+                if (x < 32 && y < 32) || (x >= 32 && y >= 32) {
+                    img.put_pixel(x, y, image::Luma([240]));
+                } else {
+                    img.put_pixel(x, y, image::Luma([15]));
+                }
+            }
+        }
+
+        // Perturbed initial point placed at (32.3, 32.2) which is ~1.06px away from corner (31.5, 31.5)
+        let mut kps = vec![KeyPoint::new(Point2D::new(32.3, 32.2), 0.99, None)];
+
+        // Run with strict max drift = 0.4px (smaller than required 1.06px displacement)
+        refine_keypoints_subpixel_with_drift(&img, &mut kps, 7, 5, 0.005, 0.4);
+
+        // Should be rejected due to drift exceeding 0.4px and reverted to initial (32.3, 32.2)
+        assert!((kps[0].point.x - 32.3).abs() < f32::EPSILON);
+        assert!((kps[0].point.y - 32.2).abs() < f32::EPSILON);
+        assert!(matches!(
+            kps[0].subpixel_status,
+            SubpixelStatus::DriftRejected { .. }
+        ));
     }
 
     #[test]

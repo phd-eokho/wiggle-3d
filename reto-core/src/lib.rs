@@ -33,14 +33,16 @@ pub use face::{
 pub use feature::{
     clear_superpoint_model_cache, compute_file_sha256, ensure_model_cached,
     get_default_model_cache_path, get_default_ort_dylib_path, init_ort_environment_if_needed,
-    refine_keypoints_subpixel, AlignmentDiagnosticTap, AlignmentResult, BackendDevice,
-    FeatureExtractor, FeatureFrame, FeatureMatch, FeatureMatcher, FeatureTriplet, FramePair,
-    KeyPoint, KeypointScore, MatchDirection, NoOpAlignmentDiagnosticTap, PairwiseMatchSet,
-    PointDetector, RotationMatrix3x3, SuperPointConfig, SuperPointDescriptorMatcher,
+    refine_keypoints_subpixel, refine_keypoints_subpixel_with_drift, AlignmentDiagnosticTap,
+    AlignmentResult, BackendDevice, ChassisExtrinsics, FeatureExtractor, FeatureFrame,
+    FeatureMatch, FeatureMatcher, FeatureTriplet, FramePair, KeyPoint, KeypointScore,
+    MatchDirection, MatchScore, NoOpAlignmentDiagnosticTap, PairwiseMatchSet, PointDetector,
+    RotationMatrix3x3, SubpixelStatus, SuperPointConfig, SuperPointDescriptorMatcher,
     SuperPointDetector, SuperPointExtractor, TranslationVector3, TripletConsistencyConfig,
-    DEFAULT_SUBPIXEL_EPSILON_PX, DEFAULT_SUBPIXEL_MAX_ITERATIONS, DEFAULT_SUBPIXEL_PATCH_RADIUS,
-    DEFAULT_SUPERPOINT_MODEL_SHA256, DEFAULT_SUPERPOINT_MODEL_URL, FALLBACK_SUPERPOINT_MODEL_URL,
-    MODEL_CANVAS_HEIGHT, MODEL_CANVAS_WIDTH, POINT_DETECTION_MAX_LONGEST_EDGE,
+    DEFAULT_SUBPIXEL_EPSILON_PX, DEFAULT_SUBPIXEL_MAX_DRIFT_PX, DEFAULT_SUBPIXEL_MAX_ITERATIONS,
+    DEFAULT_SUBPIXEL_PATCH_RADIUS, DEFAULT_SUPERPOINT_MODEL_SHA256, DEFAULT_SUPERPOINT_MODEL_URL,
+    FALLBACK_SUPERPOINT_MODEL_URL, MODEL_CANVAS_HEIGHT, MODEL_CANVAS_WIDTH,
+    POINT_DETECTION_MAX_LONGEST_EDGE,
 };
 pub use geom::{
     FrameRoi, FrameRoiSet, GlobalCoord, HorizontalDelegator, LocalCoord, NormalizedRect,
