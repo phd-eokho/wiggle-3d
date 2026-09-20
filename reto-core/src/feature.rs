@@ -980,6 +980,18 @@ impl TripletConsistencyConfig {
     }
 }
 
+/// Pruning / validation status of a dyadic reduction tree branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum BranchStatus {
+    /// Branch is valid, active, and included in extrinsic optimization.
+    #[default]
+    Active,
+    /// Branch failed chord consistency check (residual exceeds threshold) and is pruned to prevent corrupting the tree.
+    Pruned,
+    /// Branch has zero direct correspondence observations and was synthesized from child spans.
+    Synthesized,
+}
+
 /// A dyadic interval span in the hierarchical reduction tree across 1D adjacent camera frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DyadicSpan {
@@ -999,6 +1011,87 @@ pub struct DyadicSpan {
     pub chord_residual_px: f32,
     /// Number of pairwise feature correspondences anchoring this span.
     pub match_count: usize,
+    /// Branch validation and pruning status.
+    pub status: BranchStatus,
+}
+
+/// Detailed before/after root-mean-square error (RMSE) metric and relative improvement tracking.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct RmseMetric {
+    /// Initial root-mean-square chord consistency error in pixels prior to optimization.
+    pub before: f32,
+    /// Final root-mean-square residual error in pixels following optimization.
+    pub after: f32,
+    /// Relative residual error reduction percentage: `(before - after) / before * 100.0`.
+    pub improvement_pct: f32,
+}
+
+impl RmseMetric {
+    /// Creates a new `RmseMetric` and calculates relative improvement percentage.
+    #[must_use]
+    pub fn new(before: f32, after: f32) -> Self {
+        let improvement_pct = if before > 1e-4 {
+            ((before - after) / before) * 100.0
+        } else {
+            0.0
+        };
+        Self {
+            before,
+            after,
+            improvement_pct,
+        }
+    }
+}
+
+/// Defensive fallback status of hierarchical reduction tree optimization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum FallbackStatus {
+    /// Optimization converged successfully within tolerances.
+    #[default]
+    None,
+    /// Defensive fallback was triggered to revert to safe nominal initial baseline.
+    Triggered {
+        /// Human-readable explanation describing the cause of fallback triggering.
+        reason: String,
+    },
+}
+
+impl FallbackStatus {
+    /// Returns `true` if defensive fallback was triggered.
+    #[must_use]
+    pub const fn is_triggered(&self) -> bool {
+        matches!(self, Self::Triggered { .. })
+    }
+
+    /// Returns the human-readable explanation if fallback was triggered.
+    #[must_use]
+    pub const fn reason(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Triggered { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+/// Numerical error tolerances and gating thresholds for hierarchical extrinsic optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ExtrinsicsTolerance {
+    /// Maximum allowed branch chord closure discrepancy in pixels before branch is quarantined/pruned.
+    pub max_branch_residual_px: f32,
+    /// Maximum acceptable post-optimization RMSE in pixels before triggering safe fallback.
+    pub max_acceptable_rmse_px: f32,
+    /// Enforces along-baseline camera ordering monotonicity to prevent inverted chassis geometries.
+    pub enforce_monotonicity: bool,
+}
+
+impl Default for ExtrinsicsTolerance {
+    fn default() -> Self {
+        Self {
+            max_branch_residual_px: 15.0,
+            max_acceptable_rmse_px: 25.0,
+            enforce_monotonicity: true,
+        }
+    }
 }
 
 /// Detailed diagnostic report comparing camera array extrinsics and residual errors before and after hierarchical optimization.
@@ -1006,12 +1099,8 @@ pub struct DyadicSpan {
 pub struct HierarchicalOptimizationReport {
     /// Number of camera frames in the 1D sequential array.
     pub num_cameras: usize,
-    /// Root-mean-square chord consistency error in pixels before joint optimization.
-    pub rmse_before_px: f32,
-    /// Root-mean-square residual error in pixels after joint optimization.
-    pub rmse_after_px: f32,
-    /// Relative residual error reduction percentage: `(rmse_before - rmse_after) / rmse_before * 100.0`.
-    pub relative_improvement_pct: f32,
+    /// Root-mean-square error (RMSE) before and after optimization.
+    pub rmse_px: RmseMetric,
     /// Optimized camera positions `(along_baseline_x, cross_baseline_y)` relative to Camera 0 at `(0, 0)`.
     pub camera_positions: Vec<(f32, f32)>,
     /// Optimized relative translations between adjacent lenses `(0->1, 1->2, ..., N-2->N-1)`.
@@ -1022,6 +1111,10 @@ pub struct HierarchicalOptimizationReport {
     pub level_rmse_px: Vec<f32>,
     /// Diagnostic records for all dyadic spans evaluated in the reduction tree.
     pub dyadic_spans: Vec<DyadicSpan>,
+    /// Defensive fallback status.
+    pub fallback: FallbackStatus,
+    /// Number of discordant tree branches pruned prior to or during optimization.
+    pub pruned_branches: usize,
 }
 
 /// Configuration for the hierarchical reduction tree and joint extrinsic optimizer.
@@ -1031,6 +1124,8 @@ pub struct HierarchicalExtrinsicsConfig {
     pub huber_threshold_px: f32,
     /// Regularization weight for hierarchical chord closure consistency constraints.
     pub chord_consistency_weight: f32,
+    /// Defensive validation tolerances and fallback thresholds.
+    pub tolerance: ExtrinsicsTolerance,
     /// Maximum optimization iterations for IRLS (Iteratively Reweighted Least Squares).
     pub max_iterations: usize,
     /// Convergence tolerance on parameter update norm.
@@ -1042,6 +1137,7 @@ impl Default for HierarchicalExtrinsicsConfig {
         Self {
             huber_threshold_px: 2.0,
             chord_consistency_weight: 1.0,
+            tolerance: ExtrinsicsTolerance::default(),
             max_iterations: 10,
             convergence_epsilon: 1e-4,
         }
@@ -1191,6 +1287,11 @@ impl HierarchicalReductionTree {
                 }
                 let mid = i + stride / 2;
                 let (obs, count) = obs_map.get(&(i, k)).copied().unwrap_or(((0.0, 0.0), 0));
+                let status = if count > 0 {
+                    BranchStatus::Active
+                } else {
+                    BranchStatus::Synthesized
+                };
                 spans.push(DyadicSpan {
                     start_frame: i,
                     end_frame: k,
@@ -1200,6 +1301,7 @@ impl HierarchicalReductionTree {
                     composed_translation: (0.0, 0.0),
                     chord_residual_px: 0.0,
                     match_count: count,
+                    status,
                 });
             }
             stride *= 2;
@@ -1210,6 +1312,11 @@ impl HierarchicalReductionTree {
         if n > 2 && !spans.iter().any(|s| s.start_frame == 0 && s.end_frame == n - 1) {
             let mid = n / 2;
             let (obs, count) = obs_map.get(&(0, n - 1)).copied().unwrap_or(((0.0, 0.0), 0));
+            let status = if count > 0 {
+                BranchStatus::Active
+            } else {
+                BranchStatus::Synthesized
+            };
             spans.push(DyadicSpan {
                 start_frame: 0,
                 end_frame: n - 1,
@@ -1219,6 +1326,7 @@ impl HierarchicalReductionTree {
                 composed_translation: (0.0, 0.0),
                 chord_residual_px: 0.0,
                 match_count: count,
+                status,
             });
         }
 
@@ -1271,63 +1379,87 @@ impl HierarchicalReductionTree {
     ///
     /// # Returns
     /// A [`HierarchicalOptimizationReport`] containing before/after RMSE, relative improvement,
-    /// optimized camera positions, and center sags.
+    /// optimized camera positions, center sags, and defensive fallback diagnostics.
     #[must_use]
     #[allow(
         clippy::cast_precision_loss,
         clippy::similar_names,
         clippy::suboptimal_flops,
-        clippy::too_many_lines
+        clippy::too_many_lines,
+        clippy::imprecise_flops
     )]
     pub fn optimize(&self, config: &HierarchicalExtrinsicsConfig) -> HierarchicalOptimizationReport {
         let n = self.num_frames;
         if n < 2 || self.spans.is_empty() {
             return HierarchicalOptimizationReport {
                 num_cameras: n,
-                rmse_before_px: 0.0,
-                rmse_after_px: 0.0,
-                relative_improvement_pct: 0.0,
+                rmse_px: RmseMetric::default(),
                 camera_positions: vec![(0.0, 0.0); n],
                 adjacent_translations: vec![(0.0, 0.0); n.saturating_sub(1)],
                 center_sags_px: vec![0.0; n.saturating_sub(2)],
                 level_rmse_px: Vec::new(),
                 dyadic_spans: self.spans.clone(),
+                fallback: FallbackStatus::None,
+                pruned_branches: 0,
             };
         }
 
-        // 1. Evaluate pre-optimization RMSE across non-leaf dyadic spans
-        let mut pre_sq_err = 0.0_f32;
-        let mut pre_count = 0usize;
+        // 1. Pre-optimization screening and branch pruning
+        let mut active_spans = self.spans.clone();
+        let mut pruned_branches_count = 0usize;
         let mut max_level = 0usize;
 
-        for s in &self.spans {
+        for s in &mut active_spans {
             max_level = max_level.max(s.level);
-            if s.level > 0 && s.match_count > 0 {
+            if s.level > 0
+                && s.match_count > 0
+                && s.chord_residual_px > config.tolerance.max_branch_residual_px
+            {
+                s.status = BranchStatus::Pruned;
+                pruned_branches_count += 1;
+                tracing::warn!(
+                    span = ?(s.start_frame, s.end_frame),
+                    chord_residual_px = s.chord_residual_px,
+                    threshold_px = config.tolerance.max_branch_residual_px,
+                    "Pruned discordant hierarchical reduction tree branch to prevent optimization contamination"
+                );
+            }
+        }
+
+        // Evaluate pre-optimization RMSE across non-leaf non-pruned dyadic spans
+        let mut pre_sq_err = 0.0_f32;
+        let mut pre_count = 0usize;
+        for s in &active_spans {
+            if s.level > 0 && s.match_count > 0 && s.status != BranchStatus::Pruned {
                 pre_sq_err += s.chord_residual_px * s.chord_residual_px;
                 pre_count += 1;
             }
         }
-
         let rmse_before_px = if pre_count > 0 {
             (pre_sq_err / pre_count as f32).sqrt()
         } else {
             0.0
         };
 
-        // 2. Solve linear least squares for camera positions [t_1 ... t_{n-1}] (t_0 = 0)
+        // 2. Initialize safe baseline from adjacent level 0 leaves
         let num_vars = n - 1;
-        let mut pos_x = vec![0.0_f32; n];
-        let mut pos_y = vec![0.0_f32; n];
+        let mut initial_pos_x = vec![0.0_f32; n];
+        let mut initial_pos_y = vec![0.0_f32; n];
 
-        // Initialize from adjacent level 0 leaves
-        for s in &self.spans {
+        for s in &active_spans {
             if s.level == 0 && s.start_frame + 1 == s.end_frame {
-                pos_x[s.end_frame] = pos_x[s.start_frame] + s.observed_translation.0;
-                pos_y[s.end_frame] = pos_y[s.start_frame] + s.observed_translation.1;
+                initial_pos_x[s.end_frame] =
+                    initial_pos_x[s.start_frame] + s.observed_translation.0;
+                initial_pos_y[s.end_frame] =
+                    initial_pos_y[s.start_frame] + s.observed_translation.1;
             }
         }
 
+        let mut pos_x = initial_pos_x.clone();
+        let mut pos_y = initial_pos_y.clone();
+
         let delta = config.huber_threshold_px.max(0.1);
+        let mut solver_failed = false;
 
         // Run IRLS iterations
         for _iter in 0..config.max_iterations {
@@ -1343,9 +1475,9 @@ impl HierarchicalReductionTree {
                     row[i] += 1e-6;
                 }
 
-                // Accumulate direct observed constraints
-                for s in &self.spans {
-                    if s.match_count == 0 {
+                // Accumulate direct observed constraints (skipping pruned branches)
+                for s in &active_spans {
+                    if s.match_count == 0 || s.status == BranchStatus::Pruned {
                         continue;
                     }
                     let target = if coord == 0 {
@@ -1384,8 +1516,8 @@ impl HierarchicalReductionTree {
 
                 // Accumulate hierarchical chord closure consistency constraints
                 if config.chord_consistency_weight > 0.0 {
-                    for s in &self.spans {
-                        if s.level == 0 {
+                    for s in &active_spans {
+                        if s.level == 0 || s.status == BranchStatus::Pruned {
                             continue;
                         }
                         let target = if coord == 0 {
@@ -1429,7 +1561,13 @@ impl HierarchicalReductionTree {
                     } else {
                         u_y = sol;
                     }
+                } else {
+                    solver_failed = true;
                 }
+            }
+
+            if solver_failed {
+                break;
             }
 
             // Update positions
@@ -1447,7 +1585,85 @@ impl HierarchicalReductionTree {
             }
         }
 
-        // 3. Post-optimization diagnostics
+        // 3. Post-solve verification and safe fallback sanity check
+        let mut fallback_triggered = false;
+        let mut fallback_reason = None;
+
+        if solver_failed {
+            fallback_triggered = true;
+            fallback_reason =
+                Some("Linear solver singularity / ill-conditioned matrix".to_string());
+        } else if pos_x.iter().any(|v| !v.is_finite()) || pos_y.iter().any(|v| !v.is_finite()) {
+            fallback_triggered = true;
+            fallback_reason =
+                Some("Non-finite camera positions detected after optimization".to_string());
+        } else if config.tolerance.enforce_monotonicity && n >= 2 {
+            // Check along-baseline monotonicity
+            let nominal_total = initial_pos_x[n - 1] - initial_pos_x[0];
+            if nominal_total.abs() > 1.0 {
+                let is_positive = nominal_total > 0.0;
+                for v in 0..n - 1 {
+                    let step = pos_x[v + 1] - pos_x[v];
+                    if (is_positive && step <= 0.0) || (!is_positive && step >= 0.0) {
+                        fallback_triggered = true;
+                        fallback_reason = Some(format!(
+                            "Monotonicity violation between Camera {} and {}: step={:.2}px",
+                            v,
+                            v + 1,
+                            step
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Compute preliminary RMSE to verify no severe degradation
+        let mut post_sq_err = 0.0_f32;
+        let mut post_count = 0usize;
+        for s in &active_spans {
+            if s.match_count > 0 && s.status != BranchStatus::Pruned {
+                let opt_dx = pos_x[s.end_frame] - pos_x[s.start_frame];
+                let opt_dy = pos_y[s.end_frame] - pos_y[s.start_frame];
+                let rx = s.observed_translation.0 - opt_dx;
+                let ry = s.observed_translation.1 - opt_dy;
+                let res = rx.hypot(ry);
+                post_sq_err += res * res;
+                post_count += 1;
+            }
+        }
+        let test_rmse_after = if post_count > 0 {
+            (post_sq_err / post_count as f32).sqrt()
+        } else {
+            0.0
+        };
+
+        if !fallback_triggered {
+            if test_rmse_after > config.tolerance.max_acceptable_rmse_px {
+                fallback_triggered = true;
+                fallback_reason = Some(format!(
+                    "Post-optimization RMSE {test_rmse_after:.2}px exceeded threshold {:.2}px",
+                    config.tolerance.max_acceptable_rmse_px
+                ));
+            } else if rmse_before_px > 1.0 && test_rmse_after > 1.5 * rmse_before_px {
+                fallback_triggered = true;
+                fallback_reason = Some(format!(
+                    "Optimization degraded residual error: {rmse_before_px:.2}px -> {test_rmse_after:.2}px"
+                ));
+            }
+        }
+
+        // Revert to initial safe positions if fallback was triggered
+        if fallback_triggered {
+            pos_x = initial_pos_x;
+            pos_y = initial_pos_y;
+            tracing::warn!(
+                reason = ?fallback_reason,
+                "Hierarchical extrinsic optimization triggered defensive fallback to nominal initial baseline"
+            );
+        }
+
+        // 4. Final diagnostics calculation
         let camera_positions: Vec<(f32, f32)> =
             pos_x.iter().copied().zip(pos_y.iter().copied()).collect();
 
@@ -1456,7 +1672,6 @@ impl HierarchicalReductionTree {
             adjacent_translations.push((pos_x[v + 1] - pos_x[v], pos_y[v + 1] - pos_y[v]));
         }
 
-        // Interior camera center sags relative to the total (0, N-1) chord
         let chord_dy = pos_y[n - 1] - pos_y[0];
         let mut center_sags_px = Vec::with_capacity(n.saturating_sub(2));
         for v in 1..n - 1 {
@@ -1465,14 +1680,13 @@ impl HierarchicalReductionTree {
             center_sags_px.push(pos_y[v] - expected_y);
         }
 
-        // Updated dyadic spans and per-level post-optimization RMSE
-        let mut updated_spans = self.spans.clone();
-        let mut post_sq_err = 0.0_f32;
-        let mut post_count = 0usize;
+        let mut final_spans = active_spans;
+        let mut final_sq_err = 0.0_f32;
+        let mut final_count = 0usize;
         let mut level_sq = vec![0.0_f32; max_level + 1];
         let mut level_cnt = vec![0usize; max_level + 1];
 
-        for s in &mut updated_spans {
+        for s in &mut final_spans {
             let opt_dx = pos_x[s.end_frame] - pos_x[s.start_frame];
             let opt_dy = pos_y[s.end_frame] - pos_y[s.start_frame];
             s.composed_translation = (opt_dx, opt_dy);
@@ -1483,26 +1697,31 @@ impl HierarchicalReductionTree {
                 let res = rx.hypot(ry);
                 s.chord_residual_px = res;
 
-                post_sq_err += res * res;
-                post_count += 1;
+                if s.status != BranchStatus::Pruned {
+                    final_sq_err += res * res;
+                    final_count += 1;
 
-                if s.level <= max_level {
-                    level_sq[s.level] += res * res;
-                    level_cnt[s.level] += 1;
+                    if s.level <= max_level {
+                        level_sq[s.level] += res * res;
+                        level_cnt[s.level] += 1;
+                    }
                 }
             }
         }
 
-        let rmse_after_px = if post_count > 0 {
-            (post_sq_err / post_count as f32).sqrt()
+        let rmse_after_px = if final_count > 0 {
+            (final_sq_err / final_count as f32).sqrt()
         } else {
             0.0
         };
 
-        let relative_improvement_pct = if rmse_before_px > 1e-4 {
-            ((rmse_before_px - rmse_after_px) / rmse_before_px) * 100.0
+        let rmse_px = RmseMetric::new(rmse_before_px, rmse_after_px);
+        let fallback = if fallback_triggered {
+            FallbackStatus::Triggered {
+                reason: fallback_reason.unwrap_or_else(|| "Unknown fallback condition".to_string()),
+            }
         } else {
-            0.0
+            FallbackStatus::None
         };
 
         let level_rmse_px: Vec<f32> = level_sq
@@ -1513,22 +1732,24 @@ impl HierarchicalReductionTree {
 
         tracing::info!(
             num_cameras = n,
-            rmse_before_px,
-            rmse_after_px,
-            relative_improvement_pct,
+            rmse_before_px = rmse_px.before,
+            rmse_after_px = rmse_px.after,
+            relative_improvement_pct = rmse_px.improvement_pct,
+            fallback_triggered = fallback.is_triggered(),
+            pruned_branches = pruned_branches_count,
             "Hierarchical camera array extrinsic optimization completed"
         );
 
         HierarchicalOptimizationReport {
             num_cameras: n,
-            rmse_before_px,
-            rmse_after_px,
-            relative_improvement_pct,
+            rmse_px,
             camera_positions,
             adjacent_translations,
             center_sags_px,
             level_rmse_px,
-            dyadic_spans: updated_spans,
+            dyadic_spans: final_spans,
+            fallback,
+            pruned_branches: pruned_branches_count,
         }
     }
 }
@@ -1714,7 +1935,7 @@ impl ChassisExtrinsics {
             translation_02: t02,
             center_sag_px,
             empirical_baseline_ratio,
-            rmse_consistency_px: report.rmse_after_px,
+            rmse_consistency_px: report.rmse_px.after,
             inlier_count: total_inliers,
             hierarchical_report: Some(report),
         }
@@ -4057,7 +4278,7 @@ mod tests {
         assert!((report.camera_positions[2].1 - 0.0).abs() < 1e-3);
         assert_eq!(report.center_sags_px.len(), 1);
         assert!((report.center_sags_px[0] - 2.0).abs() < 1e-3);
-        assert!(report.rmse_after_px < 0.01);
+        assert!(report.rmse_px.after < 0.01);
     }
 
     #[test]
@@ -4134,6 +4355,145 @@ mod tests {
         assert_eq!(report.num_cameras, 4);
         assert_eq!(report.adjacent_translations.len(), 3);
         assert_eq!(report.center_sags_px.len(), 2);
-        assert!(report.rmse_after_px < 0.05);
+        assert!(report.rmse_px.after < 0.05);
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_branch_pruning() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.25, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None)],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(80.0, 50.0), 0.9, None)],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![
+                KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None), // Inlier for m12 (disp = 20)
+                KeyPoint::new(Point2D::new(10.0, 50.0), 0.9, None), // False outlier for m02 (disp = 90)
+            ],
+        );
+        let f3 = FeatureFrame::new(
+            3,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(40.0, 50.0), 0.9, None)],
+        );
+
+        let frames = [f0, f1, f2, f3];
+        let m01 = PairwiseMatchSet::new(
+            (0, 1),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m12 = PairwiseMatchSet::new(
+            (1, 2),
+            vec![FeatureMatch::new(0, 0, 0.9)], // matches index 0 -> disp 20.0
+            MatchDirection::Mutual,
+        );
+        let m23 = PairwiseMatchSet::new(
+            (2, 3),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m02_corrupt = PairwiseMatchSet::new(
+            (0, 2),
+            vec![FeatureMatch::new(0, 1, 0.9)], // matches index 1 -> disp 90.0 (residual 50.0px)
+            MatchDirection::Mutual,
+        );
+
+        let match_sets = [m01, m12, m23, m02_corrupt];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames,
+            &match_sets,
+            StripOrientation::Horizontal,
+        );
+
+        let config = HierarchicalExtrinsicsConfig {
+            tolerance: ExtrinsicsTolerance {
+                max_branch_residual_px: 15.0,
+                ..ExtrinsicsTolerance::default()
+            },
+            ..HierarchicalExtrinsicsConfig::default()
+        };
+        let report = tree.optimize(&config);
+
+        // Branch (0, 2) should be quarantined & pruned
+        assert!(report.pruned_branches >= 1);
+        assert!(!report.fallback.is_triggered());
+        // Positions should remain clean ~20px step between frames
+        assert!((report.camera_positions[1].0 - 20.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_hierarchical_reduction_catastrophic_fallback() {
+        let dummy_rect = NormalizedRect::new(0.0, 0.0, 0.33, 1.0).unwrap();
+        let dummy_size = Size2D::new(100, 100);
+
+        let f0 = FeatureFrame::new(
+            0,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(100.0, 50.0), 0.9, None)],
+        );
+        let f1 = FeatureFrame::new(
+            1,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(80.0, 50.0), 0.9, None)],
+        );
+        let f2 = FeatureFrame::new(
+            2,
+            dummy_rect,
+            dummy_size,
+            vec![KeyPoint::new(Point2D::new(60.0, 50.0), 0.9, None)],
+        );
+
+        let frames = [f0, f1, f2];
+        let m01 = PairwiseMatchSet::new(
+            (0, 1),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+        let m12 = PairwiseMatchSet::new(
+            (1, 2),
+            vec![FeatureMatch::new(0, 0, 0.9)],
+            MatchDirection::Mutual,
+        );
+
+        let match_sets = [m01, m12];
+        let tree = HierarchicalReductionTree::build_from_match_sets(
+            &frames,
+            &match_sets,
+            StripOrientation::Horizontal,
+        );
+
+        // Test with max_acceptable_rmse_px = 0.000_001 (impossible tolerance to trigger defensive fallback)
+        let config = HierarchicalExtrinsicsConfig {
+            tolerance: ExtrinsicsTolerance {
+                max_acceptable_rmse_px: 0.000_001,
+                ..ExtrinsicsTolerance::default()
+            },
+            ..HierarchicalExtrinsicsConfig::default()
+        };
+        let report = tree.optimize(&config);
+
+        assert!(report.fallback.is_triggered());
+        assert!(report.fallback.reason().is_some());
+        // Clean baseline retained
+        assert_eq!(report.camera_positions[0], (0.0, 0.0));
+        assert_eq!(report.camera_positions[1], (20.0, 0.0));
+        assert_eq!(report.camera_positions[2], (40.0, 0.0));
     }
 }
