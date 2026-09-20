@@ -1,8 +1,9 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::redundant_pub_crate, clippy::doc_markdown)]
 //! Core library for Reto-Split: 3D film camera image splitting, alignment, and parallax processing.
 
 // Encapsulated internal modules (thin public API facade)
+pub mod color;
 pub(crate) mod detector;
 pub(crate) mod error;
 pub(crate) mod face;
@@ -13,9 +14,14 @@ pub(crate) mod luma;
 pub(crate) mod partition;
 pub(crate) mod pipeline;
 pub(crate) mod stats;
+pub mod video;
 pub(crate) mod visualizer;
 
 // Public Facade Exports
+pub use color::{
+    Bt709LumaConverter, LumaConverter, RgbaToYuv420Converter, SimpleGrayConverter,
+    Yuv420PlanarFrame, BT709_RGB_WEIGHTS, BT709_YUV_MATRIX,
+};
 pub use detector::{
     CompositeDiagnosticTap, EvenSplitDetector, NoOpDiagnosticTap, PillarStatsDetector,
     RoiDetectionConfig, RoiDetector, RoiDiagnosticTap, SaveDenoisedLumaDiagnosticTap,
@@ -62,9 +68,8 @@ pub use gif::{
     DEFAULT_NEUQUANT_SAMPLE_FAC, DEFAULT_PALETTE_COLORS, MIN_DISPARITY_FOR_DEPTH_PX,
 };
 pub use luma::{
-    median9, Bt709LumaConverter, LumaConverter, ScaledGrayscaleStrip, ScaledLumaImage,
-    SimpleGrayConverter, BT709_RGB_WEIGHTS, DEFAULT_CROSS_PERCENTILE, DEFAULT_INVERSE_GAMMA,
-    DEFAULT_PROFILE_PERCENTILE, PROJECTION_MAX_DIMENSION,
+    median9, ScaledGrayscaleStrip, ScaledLumaImage, DEFAULT_CROSS_PERCENTILE,
+    DEFAULT_INVERSE_GAMMA, DEFAULT_PROFILE_PERCENTILE, PROJECTION_MAX_DIMENSION,
 };
 pub use partition::{
     EvenSplitPartitioner, GutterPartitioner, OptimalGridPartitioner, PartitionResult,
@@ -83,3 +88,10 @@ pub use visualizer::{
     FrameFaceRecord, RoiVisualizer, SaveFacesDiagnosticTap, SaveFeaturesDiagnosticTap,
     SaveMatchesDiagnosticTap,
 };
+pub use video::{
+    create_hevc_encoder, probe_video_encoder_backend, DEFAULT_MP4_CRF, DEFAULT_MP4_LOOPS,
+    EncodedVideoSample, HevcEncoderConfig, HevcFrameEncoder, HevcNalUnit, MediaFoundationHevcEncoder,
+    Mp4Muxer, NvencHevcEncoder, SoftwareMockHevcEncoder, VaapiHevcEncoder, VideoEncoderBackend,
+    VideoError, VideoToolboxHevcEncoder, WiggleVideoBuilder, WiggleVideoConfig,
+};
+

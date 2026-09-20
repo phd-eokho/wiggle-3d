@@ -357,7 +357,8 @@ impl PrioritizedPartitionEngine {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::luma::{ScaledGrayscaleStrip, SimpleGrayConverter, PROJECTION_MAX_DIMENSION};
+    use crate::color::SimpleGrayConverter;
+    use crate::luma::{ScaledGrayscaleStrip, PROJECTION_MAX_DIMENSION};
     use image::{Rgba, RgbaImage};
 
     #[test]

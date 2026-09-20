@@ -147,6 +147,10 @@ pub enum Error {
     #[error("Image error: {0}")]
     Image(#[from] image::ImageError),
 
+    /// Video encoding and container error wrapper.
+    #[error("Video error: {0}")]
+    Video(#[from] crate::video::VideoError),
+
     /// Placeholder for other errors.
     #[error("Unknown error: {0}")]
     Unknown(String),

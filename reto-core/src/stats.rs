@@ -660,7 +660,8 @@ pub fn matched_filter_1d(profile: &[f32], trough_radius: usize, margin_radius: u
 )]
 mod tests {
     use super::*;
-    use crate::luma::{Bt709LumaConverter, SimpleGrayConverter, PROJECTION_MAX_DIMENSION};
+    use crate::color::{Bt709LumaConverter, SimpleGrayConverter};
+    use crate::luma::{ScaledLumaImage, PROJECTION_MAX_DIMENSION};
     use image::{Rgba, RgbaImage};
 
     #[test]
