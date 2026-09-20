@@ -804,14 +804,8 @@ pub struct FeatureTriplet {
 
 /// Boundary condition configuration for rigid chassis cascaded transform and depth consistency.
 ///
-/// # TODO (Lens Distortion Modeling)
-/// Uncalibrated optical distortion from low-cost multi-lens plastic toy cameras (such as RETO 3D,
-/// Nimslo, Nishika) causes non-linear peripheral curvature mismatch near outer boundaries.
-/// When multi-view reprojection residual errors across outer frame boundaries exceed `0.5 px`,
-/// incorporate per-lens radial ($k_1, k_2$) and tangential ($p_1, p_2$) distortion parameters
-/// into joint bundle adjustment self-calibration:
-/// - $x_d = x(1 + k_1 r^2 + k_2 r^4) + 2 p_1 x y + p_2(r^2 + 2 x^2)$
-/// - $y_d = y(1 + k_1 r^2 + k_2 r^4) + p_1(r^2 + 2 y^2) + 2 p_2 x y$
+/// Encapsulates geometric thresholds for multi-view loop closure verification and
+/// cross-baseline jitter tolerances across adjacent sub-frames.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TripletConsistencyConfig {
     /// Nominal baseline ratio $B_{01} / B_{12}$ (1.0 for symmetric baseline).

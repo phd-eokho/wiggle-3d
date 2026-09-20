@@ -336,13 +336,6 @@ impl HistogramClusteringResult {
 }
 
 /// Aligns sub-frames to an anchor frame based on depth surface correspondence shifts.
-///
-/// # TODO (3D Camera Extrinsics & Epipolar Rectification)
-/// Planar 2D translation shifts align focal depth surfaces but do not model out-of-plane
-/// camera rotations (pitch/yaw/roll) between physical lenses.
-/// Decompose fundamental/essential matrices ($E = [\mathbf{t}]_\times R$) to compute true rigid
-/// relative extrinsics ($R_{01}, \mathbf{t}_{01}, R_{12}, \mathbf{t}_{12}$) and apply rectification
-/// homographies ($R_{\text{rect}}$) to align epipolar lines strictly horizontally across views.
 pub struct WiggleAligner;
 
 impl WiggleAligner {
