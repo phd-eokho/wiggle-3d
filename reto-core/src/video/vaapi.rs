@@ -4,6 +4,8 @@
 //! `libva.so.2` and `libva-drm.so.2` to drive Intel QuickSync and AMD Radeon VCN hardware encoders.
 
 #![allow(
+    dead_code,
+    unused_imports,
     unsafe_code,
     non_snake_case,
     non_camel_case_types,
