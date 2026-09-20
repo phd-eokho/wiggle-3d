@@ -40,6 +40,7 @@
 - **인물 얼굴 감지 및 초점 고정 (Face Focal Locking)**: 시선이 집중되는 인물과 얼굴 랜드마크를 자동 감지하고, 해당 위치에 초점 평면(Focal Plane)을 고정하여 피사체가 흔들림 없이 또렷하게 유지되도록 합니다.
 - **자동 서브프레임 분할 (Automated Frame Splitting)**: 원본 필름 스트립에서 각 렌즈 프레임의 경계를 자동으로 감지하고 분할(Crop)합니다.
 - **깜빡임 없는 통합 팔레트 양자화 (Flicker-Free Unified Palette)**: 모든 프레임에 걸쳐 전역 256색 팔레트와 Floyd-Steinberg dithering을 적용하여 프레임 전환 시 발생하는 색상 깜빡임을 제거합니다.
+- **네이티브 24-bit TrueColor HEVC MP4 비디오 출력**: 표준 GIF 애니메이션과 함께 $\mathrm{SE}(3)$ 시차 타이밍이 보존된 고품질 24-bit TrueColor H.265 (HEVC) MP4 비디오를 하드웨어 가속으로 생성합니다.
 - **진단용 시각화 오버레이 (Diagnostic Visual Overlays)**: `--debug` 옵션 실행 시 RoI 경계 박스, 얼굴 랜드마크, 특징점 매칭 벡터가 시각화된 디버그 이미지를 생성합니다.
 
 ---
@@ -55,7 +56,7 @@
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
 
-NVIDIA GPU (CUDA) 가속 사용 시:
+NVIDIA GPU (CUDA & NVENC) 가속 사용 시:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
@@ -70,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh
 irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
 ```
 
-NVIDIA GPU (CUDA) 가속 사용 시:
+NVIDIA GPU (CUDA & NVENC) 가속 사용 시:
 ```powershell
 $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
 ```
@@ -92,9 +93,14 @@ cargo build --release
 
 ### 기본 사용법
 
-#### 단일 스캔 파일 처리
+#### 단일 스캔 파일 처리 (기본 GIF 출력)
 ```bash
 reto-cli --input samples/film_strip_01.jpg --output output_dir/
+```
+
+#### 24-bit TrueColor HEVC MP4 비디오 함께 생성
+```bash
+reto-cli --input samples/ --output results/ --enable-mp4
 ```
 
 #### 디렉터리 내 전체 스캔 일괄 배치 처리
@@ -122,14 +128,23 @@ reto-cli [OPTIONS] --input <PATH> --output <DIR>
 | 옵션 / 플래그 | 타입 / 기본값 | 설명 |
 | :--- | :--- | :--- |
 | `-i, --input <PATH>` | `Path` (필수) | 단일 스캔 이미지 파일 경로 또는 배치 처리 대상 디렉터리 경로. |
-| `-o, --output <DIR>` | `Path` (필수) | 출력 GIF 및 진단 아티팩트가 저장될 대상 디렉터리. |
+| `-o, --output <DIR>` | `Path` (필수) | 출력 GIF, MP4 비디오 및 진단 아티팩트가 저장될 대상 디렉터리. |
 | `--debug` | `bool` (플래그) | 중간 디버그 시각화 출력 활성화 (RoI 오버레이, 특징점 매칭 벡터, 시차 로그 등). |
 | `--gif-delay <MS>` | `u32` (기본값: `100`) | 프레임 간 애니메이션 지연 시간 (밀리초 단위, 100ms = 10 fps). |
 | `--no-dither` | `bool` (플래그) | NeuQuant 색상 양자화 시 Floyd-Steinberg 디더링 비활성화. |
+| `--enable-mp4` | `bool` (플래그) | GIF와 함께 24-bit TrueColor HEVC (H.265) MP4 비디오 생성 활성화. |
+| `--enable-nvenc` | `bool` (플래그) | HEVC MP4 비디오 생성 시 NVIDIA NVENC 하드웨어 가속 강제 사용. |
+| `--mp4-loops <COUNT>` | `usize` (기본값: `4`) | MP4 비디오 내 인코딩될 핑퐁 루프 반복 횟수. |
+| `--mp4-crf <CRF>` | `u32` (기본값: `18`) | HEVC 비디오 인코딩 품질/압축률 (0–51, 낮을수록 고화질). |
 | `--no-progress` | `bool` (플래그) | 대화형 터미널 진행률 표시줄 비활성화 (CI/CD 환경 및 로그 수집에 권장). |
 | `--log-file <FILE>` | `Path` (선택) | 상세 실행 및 진단 로그가 기록될 커스텀 로그 파일 경로. |
 | `-q, --quiet` | `bool` (플래그) | 치명적 오류를 제외한 모든 콘솔 출력 억제. |
 | `-v, -vv` | `Count` (플래그) | 로그 상세 수준 증가 (`-v`: DEBUG, `-vv`: TRACE). |
+
+> [!WARNING]
+> **하드웨어 비디오 인코더 지원 현황 안내:**
+> - **NVIDIA NVENC (Linux / Windows)**: 실제 GPU 하드웨어에서 완벽하게 테스트 및 검증 완료.
+> - **Linux VA-API, macOS VideoToolbox, Windows Media Foundation**: 아키텍처 및 플랫폼 인터페이스가 구현되어 있으나, **실제 하드웨어 실기 테스트는 아직 진행되지 않았습니다 (실험적 단계)**. `--enable-mp4` 옵션 사용 시, CLI는 배치 처리를 시작하기 전에 사용 가능한 하드웨어 백엔드를 사전 검사(pre-flight check)하며 작동 가능한 하드웨어 인코더가 없을 경우 즉시 실패(fail-fast)합니다.
 
 ### 지원 이미지 포맷
 
