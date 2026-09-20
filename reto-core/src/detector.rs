@@ -2,8 +2,9 @@
 
 use crate::color::Bt709LumaConverter;
 use crate::error::RoiError;
-use crate::geom::{FrameRoi, FrameRoiSet, NormalizedRect, StripOrientation};
+use crate::geom::{FrameRoi, FrameRoiSet, NormalizedRect, OrientationDelegator, StripOrientation};
 use crate::luma::{ScaledLumaImage, DEFAULT_INVERSE_GAMMA, PROJECTION_MAX_DIMENSION};
+use crate::partition::PartitionResult;
 use crate::stats::AxisStatisticsProfile;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
@@ -362,12 +363,64 @@ impl PillarStatsDetector {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn prepare_denoised_profile(
+    luma: &ScaledLumaImage,
+    tap: Option<&dyn RoiDiagnosticTap>,
+) -> (AxisStatisticsProfile, f32) {
+    let mut denoised_luma = luma.clone();
+    denoised_luma.median_filter_3x3();
+    denoised_luma.inverse_gamma_stretch(DEFAULT_INVERSE_GAMMA);
+
+    let axis_stats = AxisStatisticsProfile::compute(&denoised_luma);
+
+    if let Some(t) = tap {
+        let diff_profile: Vec<f32> = axis_stats
+            .p98_minus_p5_series()
+            .iter()
+            .map(|&v| f32::from(v))
+            .collect();
+        t.on_projection_profile(&diff_profile, luma.orientation);
+    }
+
+    (axis_stats, denoised_luma.major_len as f32)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn assemble_subframe_rois(
+    partition: &PartitionResult,
+    total_major: f32,
+    delegator: &dyn OrientationDelegator,
+) -> Result<Vec<FrameRoi>, RoiError> {
+    let mut frames = Vec::with_capacity(partition.frame_spans.len());
+
+    for (i, &(f_start, f_len)) in partition.frame_spans.iter().enumerate() {
+        let norm_start = f_start as f32 / total_major;
+        let norm_len = (f_len as f32 / total_major).min(1.0_f32 - norm_start);
+
+        let rect = delegator.build_rect(norm_start, norm_len, 0.0_f32, 1.0_f32);
+        let validated_rect = NormalizedRect::new(
+            rect.x.clamp(0.0, 1.0),
+            rect.y.clamp(0.0, 1.0),
+            rect.width.clamp(0.0, 1.0),
+            rect.height.clamp(0.0, 1.0),
+        )?;
+
+        frames.push(FrameRoi {
+            index: i,
+            bounds: validated_rect,
+            confidence: partition.confidence,
+        });
+    }
+
+    Ok(frames)
+}
+
 impl RoiDetector for PillarStatsDetector {
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::suboptimal_flops,
-        clippy::too_many_lines
+        clippy::suboptimal_flops
     )]
     #[tracing::instrument(skip(self, luma, config, diagnostic_tap), level = "debug")]
     fn detect_luma(
@@ -386,32 +439,12 @@ impl RoiDetector for PillarStatsDetector {
             return Err(RoiError::ZeroExpectedFrames(0));
         }
 
-        // Broadcast intermediate luma image to diagnostic observer plugins
         if let Some(tap) = diagnostic_tap {
             tap.on_luma_image(luma);
         }
 
-        // Apply in-place 2D 3x3 branchless sorting network median denoising
-        let mut denoised_luma = luma.clone();
-        denoised_luma.median_filter_3x3();
+        let (axis_stats, total_major) = prepare_denoised_profile(luma, diagnostic_tap);
 
-        // Perform baseline subtraction and linear contrast expansion on denoised luma using min_x(P5)
-        denoised_luma.inverse_gamma_stretch(DEFAULT_INVERSE_GAMMA);
-
-        // Extract per-pixel cross-axis statistics from the denoised + gamma stretched luma image
-        let axis_stats = AxisStatisticsProfile::compute(&denoised_luma);
-
-        // Broadcast contrast spread projection profile to diagnostic taps
-        let diff_profile: Vec<f32> = axis_stats
-            .p98_minus_p5_series()
-            .iter()
-            .map(|&v| f32::from(v))
-            .collect();
-        if let Some(tap) = diagnostic_tap {
-            tap.on_projection_profile(&diff_profile, orientation);
-        }
-
-        // Evaluate prioritized partition strategies (1. Threshold -> 2. Optimal Grid -> 3. Even Split)
         let partition =
             crate::partition::PrioritizedPartitionEngine::standard().execute(&axis_stats, n);
 
@@ -419,32 +452,12 @@ impl RoiDetector for PillarStatsDetector {
             let gutter_f32: Vec<f32> = partition
                 .gutter_centers
                 .iter()
-                .map(|&c| c as f32 / denoised_luma.major_len as f32)
+                .map(|&c| c as f32 / total_major)
                 .collect();
             tap.on_gutter_candidates(&gutter_f32);
         }
 
-        let total_major = denoised_luma.major_len as f32;
-        let mut frames = Vec::with_capacity(n);
-
-        for (i, &(f_start, f_len)) in partition.frame_spans.iter().enumerate() {
-            let norm_start = f_start as f32 / total_major;
-            let norm_len = (f_len as f32 / total_major).min(1.0_f32 - norm_start);
-
-            let rect = delegator.build_rect(norm_start, norm_len, 0.0_f32, 1.0_f32);
-            let validated_rect = NormalizedRect::new(
-                rect.x.clamp(0.0, 1.0),
-                rect.y.clamp(0.0, 1.0),
-                rect.width.clamp(0.0, 1.0),
-                rect.height.clamp(0.0, 1.0),
-            )?;
-
-            frames.push(FrameRoi {
-                index: i,
-                bounds: validated_rect,
-                confidence: partition.confidence,
-            });
-        }
+        let frames = assemble_subframe_rois(&partition, total_major, delegator)?;
 
         tracing::debug!(
             strategy = partition.strategy_name,

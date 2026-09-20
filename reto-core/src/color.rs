@@ -231,10 +231,138 @@ impl Yuv420PlanarFrame {
 /// Fast parallel RGBA to YUV420p converter using BT.709 matrix multiplication.
 pub struct RgbaToYuv420Converter;
 
+#[allow(clippy::similar_names)]
+fn extract_y_plane(
+    raw_rgba: &[u8],
+    orig_w: u32,
+    orig_h: u32,
+    y_plane: &mut [u8],
+    y_stride: usize,
+    y_weights: [f32; 3],
+) {
+    let raw_stride = (orig_w * 4) as usize;
+    y_plane
+        .par_chunks_exact_mut(y_stride)
+        .enumerate()
+        .for_each(|(y_idx, y_row)| {
+            let src_y = (y_idx as u32).min(orig_h.saturating_sub(1)) as usize;
+            let row_start = src_y * raw_stride;
+            let row_bytes = &raw_rgba[row_start..row_start + raw_stride];
+
+            let chunks = row_bytes.as_chunks::<4>().0;
+            let valid_count = chunks.len().min(y_row.len());
+
+            for (out_y, chunk) in y_row[..valid_count].iter_mut().zip(chunks) {
+                let r = f32::from(chunk[0]);
+                let g = f32::from(chunk[1]);
+                let b = f32::from(chunk[2]);
+                *out_y = (y_weights[0] * r + y_weights[1] * g + y_weights[2] * b)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+
+            if valid_count < y_row.len() && valid_count > 0 {
+                let last_val = y_row[valid_count - 1];
+                for out_y in &mut y_row[valid_count..] {
+                    *out_y = last_val;
+                }
+            }
+        });
+}
+
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+fn subsample_uv_planes(
+    raw_rgba: &[u8],
+    orig_w: u32,
+    orig_h: u32,
+    u_plane: &mut [u8],
+    v_plane: &mut [u8],
+    uv_stride: usize,
+    half_w: usize,
+    u_weights: [f32; 3],
+    v_weights: [f32; 3],
+) {
+    let raw_stride = (orig_w * 4) as usize;
+    u_plane
+        .par_chunks_exact_mut(uv_stride)
+        .zip(v_plane.par_chunks_exact_mut(uv_stride))
+        .enumerate()
+        .for_each(|(uv_y, (u_row, v_row))| {
+            let y0 = uv_y * 2;
+            let y1 = (y0 + 1).min(orig_h.saturating_sub(1) as usize);
+            let y0_clamped = y0.min(orig_h.saturating_sub(1) as usize);
+            let row0_start = y0_clamped * raw_stride;
+            let row1_start = y1 * raw_stride;
+
+            let row0_chunks = raw_rgba[row0_start..row0_start + raw_stride]
+                .as_chunks::<4>()
+                .0;
+            let row1_chunks = raw_rgba[row1_start..row1_start + raw_stride]
+                .as_chunks::<4>()
+                .0;
+            let max_x = row0_chunks.len().saturating_sub(1);
+
+            for (uv_x, (u_out, v_out)) in u_row
+                .iter_mut()
+                .zip(v_row.iter_mut())
+                .take(half_w)
+                .enumerate()
+            {
+                let x0 = uv_x * 2;
+                let x1 = (x0 + 1).min(max_x);
+                let x0_clamped = x0.min(max_x);
+
+                let p00 = row0_chunks[x0_clamped];
+                let p01 = row0_chunks[x1];
+                let p10 = row1_chunks[x0_clamped];
+                let p11 = row1_chunks[x1];
+
+                let avg_r = (f32::from(p00[0])
+                    + f32::from(p01[0])
+                    + f32::from(p10[0])
+                    + f32::from(p11[0]))
+                    * 0.25;
+                let avg_g = (f32::from(p00[1])
+                    + f32::from(p01[1])
+                    + f32::from(p10[1])
+                    + f32::from(p11[1]))
+                    * 0.25;
+                let avg_b = (f32::from(p00[2])
+                    + f32::from(p01[2])
+                    + f32::from(p10[2])
+                    + f32::from(p11[2]))
+                    * 0.25;
+
+                *u_out = (u_weights[0] * avg_r
+                    + u_weights[1] * avg_g
+                    + u_weights[2] * avg_b
+                    + 128.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+
+                *v_out = (v_weights[0] * avg_r
+                    + v_weights[1] * avg_g
+                    + v_weights[2] * avg_b
+                    + 128.0)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+
+            if half_w < u_row.len() && half_w > 0 {
+                let last_u = u_row[half_w - 1];
+                let last_v = v_row[half_w - 1];
+                for u in &mut u_row[half_w..] {
+                    *u = last_u;
+                }
+                for v in &mut v_row[half_w..] {
+                    *v = last_v;
+                }
+            }
+        });
+}
+
 impl RgbaToYuv420Converter {
-    /// Converts an [`image::RgbaImage`] to a [`Yuv420PlanarFrame`] using vectorized BT.709 matrix multiplication.
-    ///
-    /// Iterates over contiguous raw byte slices via Rayon for maximum L1 cache efficiency and SIMD auto-vectorization.
+    /// Converts a 32-bit RGBA image into an ITU-R BT.709 8-bit YUV420p Planar Frame representation.
     ///
     /// # Arguments
     /// * `rgba` - Input RGBA image.
@@ -250,7 +378,6 @@ impl RgbaToYuv420Converter {
     /// assert_eq!(yuv.height, 64);
     /// ```
     #[must_use]
-    #[allow(clippy::similar_names, clippy::too_many_lines)]
     pub fn convert(rgba: &RgbaImage) -> Yuv420PlanarFrame {
         let (orig_w, orig_h) = rgba.dimensions();
         let target_w = (orig_w + 1) & !1;
@@ -261,119 +388,21 @@ impl RgbaToYuv420Converter {
         let uv_stride = frame.uv_stride;
         let half_w = (target_w / 2) as usize;
         let raw_rgba = rgba.as_raw();
-        let raw_stride = (orig_w * 4) as usize;
 
         let [y_weights, u_weights, v_weights] = BT709_YUV_MATRIX;
 
-        // 1. Vectorized Y plane extraction over contiguous row slices
-        frame
-            .y_plane
-            .par_chunks_exact_mut(y_stride)
-            .enumerate()
-            .for_each(|(y_idx, y_row)| {
-                let src_y = (y_idx as u32).min(orig_h.saturating_sub(1)) as usize;
-                let row_start = src_y * raw_stride;
-                let row_bytes = &raw_rgba[row_start..row_start + raw_stride];
-
-                let chunks = row_bytes.as_chunks::<4>().0;
-                let valid_count = chunks.len().min(y_row.len());
-
-                for (out_y, chunk) in y_row[..valid_count].iter_mut().zip(chunks) {
-                    let r = f32::from(chunk[0]);
-                    let g = f32::from(chunk[1]);
-                    let b = f32::from(chunk[2]);
-                    *out_y = (y_weights[0] * r + y_weights[1] * g + y_weights[2] * b)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-
-                // If target width exceeds original (odd width padding), duplicate edge luma
-                if valid_count < y_row.len() && valid_count > 0 {
-                    let last_val = y_row[valid_count - 1];
-                    for out_y in &mut y_row[valid_count..] {
-                        *out_y = last_val;
-                    }
-                }
-            });
-
-        // 2. Vectorized 2x2 box subsampling for U and V chroma planes
-        frame
-            .u_plane
-            .par_chunks_exact_mut(uv_stride)
-            .zip(frame.v_plane.par_chunks_exact_mut(uv_stride))
-            .enumerate()
-            .for_each(|(uv_y, (u_row, v_row))| {
-                let y0 = uv_y * 2;
-                let y1 = (y0 + 1).min(orig_h.saturating_sub(1) as usize);
-                let y0_clamped = y0.min(orig_h.saturating_sub(1) as usize);
-                let row0_start = y0_clamped * raw_stride;
-                let row1_start = y1 * raw_stride;
-
-                let row0_chunks = raw_rgba[row0_start..row0_start + raw_stride]
-                    .as_chunks::<4>()
-                    .0;
-                let row1_chunks = raw_rgba[row1_start..row1_start + raw_stride]
-                    .as_chunks::<4>()
-                    .0;
-                let max_x = row0_chunks.len().saturating_sub(1);
-
-                for (uv_x, (u_out, v_out)) in u_row
-                    .iter_mut()
-                    .zip(v_row.iter_mut())
-                    .take(half_w)
-                    .enumerate()
-                {
-                    let x0 = uv_x * 2;
-                    let x1 = (x0 + 1).min(max_x);
-                    let x0_clamped = x0.min(max_x);
-
-                    let p00 = row0_chunks[x0_clamped];
-                    let p01 = row0_chunks[x1];
-                    let p10 = row1_chunks[x0_clamped];
-                    let p11 = row1_chunks[x1];
-
-                    let avg_r = (f32::from(p00[0])
-                        + f32::from(p01[0])
-                        + f32::from(p10[0])
-                        + f32::from(p11[0]))
-                        * 0.25;
-                    let avg_g = (f32::from(p00[1])
-                        + f32::from(p01[1])
-                        + f32::from(p10[1])
-                        + f32::from(p11[1]))
-                        * 0.25;
-                    let avg_b = (f32::from(p00[2])
-                        + f32::from(p01[2])
-                        + f32::from(p10[2])
-                        + f32::from(p11[2]))
-                        * 0.25;
-
-                    *u_out = (u_weights[0] * avg_r
-                        + u_weights[1] * avg_g
-                        + u_weights[2] * avg_b
-                        + 128.0)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-
-                    *v_out = (v_weights[0] * avg_r
-                        + v_weights[1] * avg_g
-                        + v_weights[2] * avg_b
-                        + 128.0)
-                        .round()
-                        .clamp(0.0, 255.0) as u8;
-                }
-
-                if half_w < u_row.len() && half_w > 0 {
-                    let last_u = u_row[half_w - 1];
-                    let last_v = v_row[half_w - 1];
-                    for u in &mut u_row[half_w..] {
-                        *u = last_u;
-                    }
-                    for v in &mut v_row[half_w..] {
-                        *v = last_v;
-                    }
-                }
-            });
+        extract_y_plane(raw_rgba, orig_w, orig_h, &mut frame.y_plane, y_stride, y_weights);
+        subsample_uv_planes(
+            raw_rgba,
+            orig_w,
+            orig_h,
+            &mut frame.u_plane,
+            &mut frame.v_plane,
+            uv_stride,
+            half_w,
+            u_weights,
+            v_weights,
+        );
 
         frame
     }

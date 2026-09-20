@@ -15,7 +15,8 @@
     clippy::ptr_as_ptr,
     clippy::cast_possible_wrap,
     clippy::cast_possible_truncation,
-    clippy::missing_const_for_fn
+    clippy::missing_const_for_fn,
+    clippy::missing_transmute_annotations
 )]
 
 use super::mp4_muxer::HevcNalUnit;
@@ -89,155 +90,30 @@ impl Default for VaapiHevcEncoder {
 }
 
 impl HevcFrameEncoder for VaapiHevcEncoder {
-    #[allow(clippy::too_many_lines)]
     fn initialize(&mut self, config: &HevcEncoderConfig) -> Result<(), VideoError> {
         #[cfg(target_os = "linux")]
         unsafe {
-            // Check DRM device nodes
-            let drm_paths = [
-                "/dev/dri/renderD128",
-                "/dev/dri/renderD129",
-                "/dev/dri/card0",
-            ];
-            let mut fd: c_int = -1;
-            for path in drm_paths {
-                let cpath =
-                    CString::new(path).map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
-                let opened = libc::open(cpath.as_ptr(), libc::O_RDWR);
-                if opened >= 0 {
-                    fd = opened;
-                    break;
+            let fd = open_drm_render_node()?;
+            let libs = match VaapiDynamicLib::load() {
+                Ok(l) => l,
+                Err(e) => {
+                    libc::close(fd);
+                    return Err(e);
                 }
-            }
+            };
+            let (dpy, config_id, context_id) =
+                match create_session(&libs, fd, config.width, config.height) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        libc::dlclose(libs.va_drm_lib);
+                        libc::dlclose(libs.va_lib);
+                        libc::close(fd);
+                        return Err(e);
+                    }
+                };
 
-            if fd < 0 {
-                return Err(VideoError::VaapiUnavailable(
-                    "No accessible Linux DRM graphics device nodes (/dev/dri/renderD128) found. If running on NVIDIA GPU, try --enable-nvenc.".into(),
-                ));
-            }
-
-            // Load libva and libva-drm
-            let va_name = CString::new("libva.so.2")
-                .map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
-            let va_lib = libc::dlopen(va_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-            if va_lib.is_null() {
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(
-                    "libva.so.2 runtime library not found".into(),
-                ));
-            }
-
-            let va_drm_name = CString::new("libva-drm.so.2")
-                .map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
-            let va_drm_lib = libc::dlopen(va_drm_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
-            if va_drm_lib.is_null() {
-                libc::dlclose(va_lib);
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(
-                    "libva-drm.so.2 runtime library not found".into(),
-                ));
-            }
-
-            let sym_get_display = libc::dlsym(va_drm_lib, b"vaGetDisplayDRM\0".as_ptr().cast());
-            let sym_init = libc::dlsym(va_lib, b"vaInitialize\0".as_ptr().cast());
-            let sym_create_config = libc::dlsym(va_lib, b"vaCreateConfig\0".as_ptr().cast());
-            let sym_create_ctx = libc::dlsym(va_lib, b"vaCreateContext\0".as_ptr().cast());
-
-            if sym_get_display.is_null()
-                || sym_init.is_null()
-                || sym_create_config.is_null()
-                || sym_create_ctx.is_null()
-            {
-                libc::dlclose(va_drm_lib);
-                libc::dlclose(va_lib);
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(
-                    "Missing required VA-API entrypoint symbols".into(),
-                ));
-            }
-
-            let va_get_display: VaGetDisplayDRMFn = std::mem::transmute(sym_get_display);
-            let va_init: VaInitializeFn = std::mem::transmute(sym_init);
-            let va_create_config: VaCreateConfigFn = std::mem::transmute(sym_create_config);
-            let va_create_ctx: VaCreateContextFn = std::mem::transmute(sym_create_ctx);
-
-            let dpy = va_get_display(fd);
-            if dpy.is_null() {
-                libc::dlclose(va_drm_lib);
-                libc::dlclose(va_lib);
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(
-                    "vaGetDisplayDRM returned null display".into(),
-                ));
-            }
-
-            let mut major: c_int = 0;
-            let mut minor: c_int = 0;
-            let status = va_init(dpy, &mut major, &mut minor);
-            if status != VA_STATUS_SUCCESS {
-                libc::dlclose(va_drm_lib);
-                libc::dlclose(va_lib);
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(format!(
-                    "vaInitialize failed with code: {status}"
-                )));
-            }
-
-            let mut config_id: VAConfigID = 0;
-            let cfg_status = va_create_config(
-                dpy,
-                VA_PROFILE_HEVC_MAIN,
-                VA_ENTRYPOINT_ENC_SLICE,
-                std::ptr::null_mut(),
-                0,
-                &mut config_id,
-            );
-            if cfg_status != VA_STATUS_SUCCESS {
-                let sym_term = libc::dlsym(va_lib, b"vaTerminate\0".as_ptr().cast());
-                if !sym_term.is_null() {
-                    let va_term: VaTerminateFn = std::mem::transmute(sym_term);
-                    va_term(dpy);
-                }
-                libc::dlclose(va_drm_lib);
-                libc::dlclose(va_lib);
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(format!(
-                    "Driver does not support HEVC Main Profile encode: {cfg_status}"
-                )));
-            }
-
-            let mut context_id: VAContextID = 0;
-            let ctx_status = va_create_ctx(
-                dpy,
-                config_id,
-                config.width as c_int,
-                config.height as c_int,
-                0,
-                std::ptr::null_mut(),
-                0,
-                &mut context_id,
-            );
-            if ctx_status != VA_STATUS_SUCCESS {
-                let sym_destroy_cfg = libc::dlsym(va_lib, b"vaDestroyConfig\0".as_ptr().cast());
-                if !sym_destroy_cfg.is_null() {
-                    let va_destroy_cfg: VaDestroyConfigFn = std::mem::transmute(sym_destroy_cfg);
-                    va_destroy_cfg(dpy, config_id);
-                }
-                let sym_term = libc::dlsym(va_lib, b"vaTerminate\0".as_ptr().cast());
-                if !sym_term.is_null() {
-                    let va_term: VaTerminateFn = std::mem::transmute(sym_term);
-                    va_term(dpy);
-                }
-                libc::dlclose(va_drm_lib);
-                libc::dlclose(va_lib);
-                libc::close(fd);
-                return Err(VideoError::VaapiUnavailable(format!(
-                    "vaCreateContext failed: {ctx_status}"
-                )));
-            }
-
-            self._va_lib = va_lib;
-            self._va_drm_lib = va_drm_lib;
+            self._va_lib = libs.va_lib;
+            self._va_drm_lib = libs.va_drm_lib;
             self.drm_fd = fd;
             self.display = dpy;
             self.config_id = config_id;
@@ -318,3 +194,176 @@ impl Drop for VaapiHevcEncoder {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+fn open_drm_render_node() -> Result<c_int, VideoError> {
+    let drm_paths = [
+        "/dev/dri/renderD128",
+        "/dev/dri/renderD129",
+        "/dev/dri/card0",
+    ];
+    for path in drm_paths {
+        let cpath = CString::new(path).map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
+        let opened = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR) };
+        if opened >= 0 {
+            return Ok(opened);
+        }
+    }
+    Err(VideoError::VaapiUnavailable(
+        "No accessible Linux DRM graphics device nodes (/dev/dri/renderD128) found. If running on NVIDIA GPU, try --enable-nvenc.".into(),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+struct VaapiDynamicLib {
+    va_lib: *mut c_void,
+    va_drm_lib: *mut c_void,
+    get_display: VaGetDisplayDRMFn,
+    init: VaInitializeFn,
+    create_config: VaCreateConfigFn,
+    create_context: VaCreateContextFn,
+}
+
+#[cfg(target_os = "linux")]
+impl VaapiDynamicLib {
+    unsafe fn load() -> Result<Self, VideoError> {
+        let va_name = CString::new("libva.so.2")
+            .map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
+        let va_lib = unsafe { libc::dlopen(va_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if va_lib.is_null() {
+            return Err(VideoError::VaapiUnavailable(
+                "libva.so.2 runtime library not found".into(),
+            ));
+        }
+
+        let va_drm_name = CString::new("libva-drm.so.2")
+            .map_err(|e| VideoError::VaapiUnavailable(e.to_string()))?;
+        let va_drm_lib = unsafe { libc::dlopen(va_drm_name.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
+        if va_drm_lib.is_null() {
+            unsafe { libc::dlclose(va_lib) };
+            return Err(VideoError::VaapiUnavailable(
+                "libva-drm.so.2 runtime library not found".into(),
+            ));
+        }
+
+        let sym_get_display = unsafe { libc::dlsym(va_drm_lib, b"vaGetDisplayDRM\0".as_ptr().cast()) };
+        let sym_init = unsafe { libc::dlsym(va_lib, b"vaInitialize\0".as_ptr().cast()) };
+        let sym_create_config = unsafe { libc::dlsym(va_lib, b"vaCreateConfig\0".as_ptr().cast()) };
+        let sym_create_ctx = unsafe { libc::dlsym(va_lib, b"vaCreateContext\0".as_ptr().cast()) };
+
+        if sym_get_display.is_null()
+            || sym_init.is_null()
+            || sym_create_config.is_null()
+            || sym_create_ctx.is_null()
+        {
+            unsafe {
+                libc::dlclose(va_drm_lib);
+                libc::dlclose(va_lib);
+            }
+            return Err(VideoError::VaapiUnavailable(
+                "Missing required VA-API entrypoint symbols".into(),
+            ));
+        }
+
+        unsafe {
+            Ok(Self {
+                va_lib,
+                va_drm_lib,
+                get_display: std::mem::transmute(sym_get_display),
+                init: std::mem::transmute(sym_init),
+                create_config: std::mem::transmute(sym_create_config),
+                create_context: std::mem::transmute(sym_create_ctx),
+            })
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn create_session(
+    libs: &VaapiDynamicLib,
+    fd: c_int,
+    width: u32,
+    height: u32,
+) -> Result<(VADisplay, VAConfigID, VAContextID), VideoError> {
+    let dpy = unsafe { (libs.get_display)(fd) };
+    if dpy.is_null() {
+        return Err(VideoError::VaapiUnavailable(
+            "vaGetDisplayDRM returned null display".into(),
+        ));
+    }
+
+    let mut major: c_int = 0;
+    let mut minor: c_int = 0;
+    let status = unsafe { (libs.init)(dpy, &mut major, &mut minor) };
+    if status != VA_STATUS_SUCCESS {
+        return Err(VideoError::VaapiUnavailable(format!(
+            "vaInitialize failed with code: {status}"
+        )));
+    }
+
+    let mut config_id: VAConfigID = 0;
+    let cfg_status = unsafe {
+        (libs.create_config)(
+            dpy,
+            VA_PROFILE_HEVC_MAIN,
+            VA_ENTRYPOINT_ENC_SLICE,
+            std::ptr::null_mut(),
+            0,
+            &mut config_id,
+        )
+    };
+    if cfg_status != VA_STATUS_SUCCESS {
+        unsafe { terminate_display(libs.va_lib, dpy) };
+        return Err(VideoError::VaapiUnavailable(format!(
+            "Driver does not support HEVC Main Profile encode: {cfg_status}"
+        )));
+    }
+
+    let mut context_id: VAContextID = 0;
+    let ctx_status = unsafe {
+        (libs.create_context)(
+            dpy,
+            config_id,
+            width as c_int,
+            height as c_int,
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut context_id,
+        )
+    };
+    if ctx_status != VA_STATUS_SUCCESS {
+        unsafe {
+            destroy_config(libs.va_lib, dpy, config_id);
+            terminate_display(libs.va_lib, dpy);
+        }
+        return Err(VideoError::VaapiUnavailable(format!(
+            "vaCreateContext failed: {ctx_status}"
+        )));
+    }
+
+    Ok((dpy, config_id, context_id))
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn terminate_display(va_lib: *mut c_void, dpy: VADisplay) {
+    unsafe {
+        let sym_term = libc::dlsym(va_lib, b"vaTerminate\0".as_ptr().cast());
+        if !sym_term.is_null() {
+            let va_term: VaTerminateFn = std::mem::transmute(sym_term);
+            va_term(dpy);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+unsafe fn destroy_config(va_lib: *mut c_void, dpy: VADisplay, config_id: VAConfigID) {
+    unsafe {
+        let sym_destroy_cfg = libc::dlsym(va_lib, b"vaDestroyConfig\0".as_ptr().cast());
+        if !sym_destroy_cfg.is_null() {
+            let va_destroy_cfg: VaDestroyConfigFn = std::mem::transmute(sym_destroy_cfg);
+            va_destroy_cfg(dpy, config_id);
+        }
+    }
+}
+

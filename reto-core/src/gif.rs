@@ -203,13 +203,95 @@ struct HistogramClusteringResult {
     target_cluster_idx: usize,
 }
 
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn group_bins_into_clusters(
+    populated_bins: &[i32],
+    effective_bin_size: f32,
+    effective_tolerance: f32,
+) -> Vec<Vec<i32>> {
+    if effective_tolerance <= 0.0 {
+        return populated_bins.iter().map(|&b| vec![b]).collect();
+    }
+    let max_bin_gap = (effective_tolerance / effective_bin_size).ceil().max(1.0) as i32;
+    let mut clusters: Vec<Vec<i32>> = Vec::new();
+    let mut current_cluster: Vec<i32> = Vec::new();
+
+    for &b in populated_bins {
+        if let Some(&last_b) = current_cluster.last() {
+            if (b - last_b).abs() <= max_bin_gap {
+                current_cluster.push(b);
+            } else {
+                clusters.push(std::mem::replace(&mut current_cluster, vec![b]));
+            }
+        } else {
+            current_cluster.push(b);
+        }
+    }
+    if !current_cluster.is_empty() {
+        clusters.push(current_cluster);
+    }
+    clusters
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn find_target_foreground_bin(
+    populated_bins: &[i32],
+    bin_map: &std::collections::BTreeMap<i32, Vec<usize>>,
+    total_pts: usize,
+) -> Option<i32> {
+    let min_points_threshold = ((total_pts as f32) * DEFAULT_FOREGROUND_MIN_PROPORTION)
+        .ceil()
+        .max(1.0) as usize;
+
+    let first_foreground_bin = populated_bins
+        .iter()
+        .copied()
+        .find(|b| bin_map.get(b).map_or(0, Vec::len) >= min_points_threshold)?;
+
+    let mut best_bin = first_foreground_bin;
+    let mut best_count = bin_map.get(&first_foreground_bin).map_or(0, Vec::len);
+    let mut curr_bin = first_foreground_bin;
+
+    loop {
+        let next_bin = curr_bin + 1;
+        let next_count = bin_map.get(&next_bin).map_or(0, Vec::len);
+        if next_count == 0 || next_count < best_count {
+            break;
+        }
+        best_bin = next_bin;
+        best_count = next_count;
+        curr_bin = next_bin;
+    }
+    Some(best_bin)
+}
+
+fn select_target_cluster(
+    clusters: &[Vec<i32>],
+    target_bin: Option<i32>,
+    bin_map: &std::collections::BTreeMap<i32, Vec<usize>>,
+) -> usize {
+    if clusters.len() <= 1 {
+        return 0;
+    }
+    if let Some(bin) = target_bin {
+        if let Some((idx, _)) = clusters.iter().enumerate().find(|(_, c)| c.contains(&bin)) {
+            return idx;
+        }
+    }
+    clusters
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, c)| {
+            c.iter()
+                .filter_map(|b| bin_map.get(b))
+                .map(Vec::len)
+                .sum::<usize>()
+        })
+        .map_or(0, |(i, _)| i)
+}
+
 impl HistogramClusteringResult {
-    #[allow(
-        clippy::too_many_lines,
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
+    #[allow(clippy::cast_possible_truncation)]
     fn compute<T, F>(
         items: &[T],
         get_inv_disp: F,
@@ -235,96 +317,9 @@ impl HistogramClusteringResult {
             return None;
         }
 
-        let clusters = if effective_tolerance <= 0.0 {
-            populated_bins.iter().map(|&b| vec![b]).collect()
-        } else {
-            let max_bin_gap = (effective_tolerance / effective_bin_size).ceil().max(1.0) as i32;
-            let mut clusters: Vec<Vec<i32>> = Vec::new();
-            let mut current_cluster: Vec<i32> = Vec::new();
-
-            for &b in &populated_bins {
-                if let Some(&last_b) = current_cluster.last() {
-                    if (b - last_b).abs() <= max_bin_gap {
-                        current_cluster.push(b);
-                    } else {
-                        clusters.push(std::mem::replace(&mut current_cluster, vec![b]));
-                    }
-                } else {
-                    current_cluster.push(b);
-                }
-            }
-            if !current_cluster.is_empty() {
-                clusters.push(current_cluster);
-            }
-            clusters
-        };
-
-        let total_pts = items.len();
-        let min_points_threshold = ((total_pts as f32) * DEFAULT_FOREGROUND_MIN_PROPORTION)
-            .ceil()
-            .max(1.0) as usize;
-
-        let first_foreground_bin = populated_bins
-            .iter()
-            .copied()
-            .find(|b| bin_map.get(b).map_or(0, Vec::len) >= min_points_threshold);
-
-        let target_bin = first_foreground_bin.map(|b_0| {
-            let mut best_bin = b_0;
-            let mut best_count = bin_map.get(&b_0).map_or(0, Vec::len);
-            let mut curr_bin = b_0;
-
-            loop {
-                let next_bin = curr_bin + 1;
-                let next_count = bin_map.get(&next_bin).map_or(0, Vec::len);
-                if next_count == 0 {
-                    break;
-                }
-                if next_count >= best_count {
-                    best_bin = next_bin;
-                    best_count = next_count;
-                    curr_bin = next_bin;
-                } else {
-                    break;
-                }
-            }
-            best_bin
-        });
-
-        let target_cluster_idx = if clusters.len() == 1 {
-            0
-        } else if let Some(bin) = target_bin {
-            clusters
-                .iter()
-                .enumerate()
-                .find(|(_, c)| c.contains(&bin))
-                .map_or_else(
-                    || {
-                        clusters
-                            .iter()
-                            .enumerate()
-                            .max_by_key(|(_, c)| {
-                                c.iter()
-                                    .filter_map(|b| bin_map.get(b))
-                                    .map(Vec::len)
-                                    .sum::<usize>()
-                            })
-                            .map_or(0, |(i, _)| i)
-                    },
-                    |(i, _)| i,
-                )
-        } else {
-            clusters
-                .iter()
-                .enumerate()
-                .max_by_key(|(_, c)| {
-                    c.iter()
-                        .filter_map(|b| bin_map.get(b))
-                        .map(Vec::len)
-                        .sum::<usize>()
-                })
-                .map_or(0, |(i, _)| i)
-        };
+        let clusters = group_bins_into_clusters(&populated_bins, effective_bin_size, effective_tolerance);
+        let target_bin = find_target_foreground_bin(&populated_bins, &bin_map, items.len());
+        let target_cluster_idx = select_target_cluster(&clusters, target_bin, &bin_map);
 
         Some(Self {
             bin_map,
@@ -333,6 +328,189 @@ impl HistogramClusteringResult {
             target_cluster_idx,
         })
     }
+}
+
+struct TripletDisplacement {
+    inv_disp: f32,
+    dx_01: f32,
+    dy_01: f32,
+    dx_21: f32,
+    dy_21: f32,
+}
+
+#[allow(clippy::suboptimal_flops, clippy::similar_names, clippy::imprecise_flops)]
+fn collect_triplet_displacements(
+    features: &[FeatureFrame],
+    triplets: &[FeatureTriplet],
+) -> Vec<TripletDisplacement> {
+    let mut data = Vec::with_capacity(triplets.len());
+    for t in triplets {
+        if t.index_0 < features[0].keypoints.len()
+            && t.index_1 < features[1].keypoints.len()
+            && t.index_2 < features[2].keypoints.len()
+        {
+            let p0 = features[0].keypoints[t.index_0].point;
+            let p1 = features[1].keypoints[t.index_1].point;
+            let p2 = features[2].keypoints[t.index_2].point;
+
+            let dx_01 = p1.x - p0.x;
+            let dy_01 = p1.y - p0.y;
+            let dx_21 = p1.x - p2.x;
+            let dy_21 = p1.y - p2.y;
+
+            let mag_01 = (dx_01 * dx_01 + dy_01 * dy_01).sqrt();
+            let mag_21 = (dx_21 * dx_21 + dy_21 * dy_21).sqrt();
+            let disp_mag = f32::midpoint(mag_01, mag_21);
+
+            if disp_mag > MIN_DISPARITY_FOR_DEPTH_PX {
+                let inv_disp = 1.0 / disp_mag;
+                data.push(TripletDisplacement {
+                    inv_disp,
+                    dx_01,
+                    dy_01,
+                    dx_21,
+                    dy_21,
+                });
+            }
+        }
+    }
+    data
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn compute_depth_surface_shifts(
+    cluster_indices: &[usize],
+    data: &[TripletDisplacement],
+) -> ([(f32, f32); 3], f32) {
+    let count = cluster_indices.len() as f32;
+    let mut accum = [0.0_f32; 4];
+
+    for &idx in cluster_indices {
+        let item = &data[idx];
+        accum[0] += item.dx_01;
+        accum[1] += item.dy_01;
+        accum[2] += item.dx_21;
+        accum[3] += item.dy_21;
+    }
+
+    let inv_count = 1.0 / count;
+    let shift_0 = (accum[0] * inv_count, accum[1] * inv_count);
+    let shift_1 = (0.0, 0.0);
+    let shift_2 = (accum[2] * inv_count, accum[3] * inv_count);
+    ([shift_0, shift_1, shift_2], inv_count)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
+fn build_disparity_histogram_records(
+    bin_map: &std::collections::BTreeMap<i32, Vec<usize>>,
+    populated_bins: &[i32],
+    clusters: &[Vec<i32>],
+    target_cluster_idx: usize,
+    total_samples: usize,
+    effective_bin_size: f32,
+) -> Vec<DisparityBinRecord> {
+    let min_bin = *populated_bins.first().unwrap_or(&0);
+    let max_bin = *populated_bins.last().unwrap_or(&0);
+
+    let mut bin_to_cluster: std::collections::HashMap<i32, usize> =
+        std::collections::HashMap::new();
+    for (c_idx, c) in clusters.iter().enumerate() {
+        for &b in c {
+            bin_to_cluster.insert(b, c_idx);
+        }
+    }
+
+    let mut bin_records = Vec::new();
+    for b in min_bin..=max_bin {
+        let cnt = bin_map.get(&b).map_or(0, Vec::len);
+        let fraction = if total_samples > 0 {
+            cnt as f32 / total_samples as f32
+        } else {
+            0.0
+        };
+        let percentage = fraction * 100.0;
+        let cluster_id = bin_to_cluster.get(&b).copied();
+        let is_selected_surface = cluster_id == Some(target_cluster_idx);
+        let bin_start_px = b as f32 * effective_bin_size;
+        let bin_end_px = (b + 1) as f32 * effective_bin_size;
+        let bin_center_px = bin_start_px + 0.5 * effective_bin_size;
+
+        bin_records.push(DisparityBinRecord {
+            bin_idx: b,
+            bin_start_px,
+            bin_end_px,
+            bin_center_px,
+            count: cnt,
+            fraction,
+            percentage,
+            cluster_id,
+            is_selected_surface,
+        });
+    }
+    bin_records
+}
+
+struct MatchDisp {
+    dx: f32,
+    dy: f32,
+    inv_disp: f32,
+}
+
+#[allow(clippy::cast_precision_loss, clippy::imprecise_flops)]
+fn calculate_pair_surface_shift(
+    pair_matches: &[FeatureMatch],
+    f_src: &FeatureFrame,
+    f_ref: &FeatureFrame,
+    effective_bin_size: f32,
+    effective_tolerance: f32,
+) -> (f32, f32) {
+    let mut list = Vec::with_capacity(pair_matches.len());
+    for m in pair_matches {
+        if m.index_a < f_src.keypoints.len() && m.index_b < f_ref.keypoints.len() {
+            let p_src = f_src.keypoints[m.index_a].point;
+            let p_ref = f_ref.keypoints[m.index_b].point;
+            let dx = p_ref.x - p_src.x;
+            let dy = p_ref.y - p_src.y;
+            let mag = (dx * dx + dy * dy).sqrt();
+            if mag > MIN_DISPARITY_FOR_DEPTH_PX {
+                let inv_disp = 1.0 / mag;
+                list.push(MatchDisp { dx, dy, inv_disp });
+            }
+        }
+    }
+
+    let Some(clustering) = HistogramClusteringResult::compute(
+        &list,
+        |item| item.inv_disp,
+        effective_bin_size,
+        effective_tolerance,
+    ) else {
+        return (0.0, 0.0);
+    };
+
+    let bin_map = clustering.bin_map;
+    let target_cluster = &clustering.clusters[clustering.target_cluster_idx];
+
+    let mut cluster_indices = Vec::new();
+    for &b in target_cluster {
+        if let Some(indices) = bin_map.get(&b) {
+            cluster_indices.extend_from_slice(indices);
+        }
+    }
+
+    if cluster_indices.is_empty() {
+        return (0.0, 0.0);
+    }
+
+    let count = cluster_indices.len() as f32;
+    let mut sum_x = 0.0;
+    let mut sum_y = 0.0;
+    for &idx in &cluster_indices {
+        sum_x += list[idx].dx;
+        sum_y += list[idx].dy;
+    }
+
+    (sum_x / count, sum_y / count)
 }
 
 /// Aligns sub-frames to an anchor frame based on depth surface correspondence shifts.
@@ -521,16 +699,8 @@ impl WiggleAligner {
     /// Tuple of `([(dx0, dy0), (dx1, dy1), (dx2, dy2)], DisparityHistogramData)`.
     #[must_use]
     #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::too_many_lines,
         clippy::imprecise_flops,
         clippy::suboptimal_flops,
-        clippy::redundant_closure_for_method_calls,
-        clippy::single_match_else,
-        clippy::map_unwrap_or,
-        clippy::items_after_statements,
         clippy::similar_names
     )]
     pub fn compute_depth_surface_shifts_from_triplets_with_debug(
@@ -564,49 +734,7 @@ impl WiggleAligner {
             return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug);
         }
 
-        // Collect per-triplet displacement data, filtering out zero/near-zero disparity (optical infinity / d <= MIN_DISPARITY_FOR_DEPTH_PX)
-        struct TripletDisplacement {
-            inv_disp: f32,
-            dx_01: f32,
-            dy_01: f32,
-            dx_21: f32,
-            dy_21: f32,
-        }
-
-        let mut data = Vec::with_capacity(triplets.len());
-
-        for t in triplets {
-            if t.index_0 < features[0].keypoints.len()
-                && t.index_1 < features[1].keypoints.len()
-                && t.index_2 < features[2].keypoints.len()
-            {
-                let p0 = features[0].keypoints[t.index_0].point;
-                let p1 = features[1].keypoints[t.index_1].point;
-                let p2 = features[2].keypoints[t.index_2].point;
-
-                let dx_01 = p1.x - p0.x;
-                let dy_01 = p1.y - p0.y;
-                let dx_21 = p1.x - p2.x;
-                let dy_21 = p1.y - p2.y;
-
-                // Combined average disparity magnitude across baselines 0-1 and 2-1
-                let mag_01 = (dx_01 * dx_01 + dy_01 * dy_01).sqrt();
-                let mag_21 = (dx_21 * dx_21 + dy_21 * dy_21).sqrt();
-                let disp_mag = f32::midpoint(mag_01, mag_21);
-
-                // Exclude 0 or near-zero disparity values to avoid infinite / undefined depth values (1/d)
-                if disp_mag > MIN_DISPARITY_FOR_DEPTH_PX {
-                    let inv_disp = 1.0 / disp_mag;
-                    data.push(TripletDisplacement {
-                        inv_disp,
-                        dx_01,
-                        dy_01,
-                        dx_21,
-                        dy_21,
-                    });
-                }
-            }
-        }
+        let data = collect_triplet_displacements(features, triplets);
 
         let Some(clustering) = HistogramClusteringResult::compute(
             &data,
@@ -623,7 +751,6 @@ impl WiggleAligner {
         let target_cluster_idx = clustering.target_cluster_idx;
         let target_cluster = &clusters[target_cluster_idx];
 
-        // 5. Gather all triplet indices in the selected depth surface cluster
         let mut cluster_triplet_indices = Vec::new();
         for &b in target_cluster {
             if let Some(indices) = bin_map.get(&b) {
@@ -635,64 +762,16 @@ impl WiggleAligner {
             return ([(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], empty_debug);
         }
 
-        // 6. Compute average translation shifts for the depth surface set
-        let count = cluster_triplet_indices.len() as f32;
-        let mut accum = [0.0_f32; 4]; // [sum_01_x, sum_01_y, sum_21_x, sum_21_y]
+        let (shifts, inv_count) = compute_depth_surface_shifts(&cluster_triplet_indices, &data);
 
-        for &idx in &cluster_triplet_indices {
-            let item = &data[idx];
-            accum[0] += item.dx_01;
-            accum[1] += item.dy_01;
-            accum[2] += item.dx_21;
-            accum[3] += item.dy_21;
-        }
-
-        let inv_count = 1.0 / count;
-        let shift_0 = (accum[0] * inv_count, accum[1] * inv_count);
-        let shift_1 = (0.0, 0.0);
-        let shift_2 = (accum[2] * inv_count, accum[3] * inv_count);
-        let shifts = [shift_0, shift_1, shift_2];
-
-        // 7. Construct complete DisparityHistogramData records
-        let min_bin = *populated_bins.first().unwrap_or(&0);
-        let max_bin = *populated_bins.last().unwrap_or(&0);
-
-        let mut bin_to_cluster: std::collections::HashMap<i32, usize> =
-            std::collections::HashMap::new();
-        for (c_idx, c) in clusters.iter().enumerate() {
-            for &b in c {
-                bin_to_cluster.insert(b, c_idx);
-            }
-        }
-
-        let total_samples = data.len();
-        let mut bin_records = Vec::new();
-        for b in min_bin..=max_bin {
-            let cnt = bin_map.get(&b).map_or(0, |v| v.len());
-            let fraction = if total_samples > 0 {
-                cnt as f32 / total_samples as f32
-            } else {
-                0.0
-            };
-            let percentage = fraction * 100.0;
-            let cluster_id = bin_to_cluster.get(&b).copied();
-            let is_selected_surface = cluster_id == Some(target_cluster_idx);
-            let bin_start_px = b as f32 * effective_bin_size;
-            let bin_end_px = (b + 1) as f32 * effective_bin_size;
-            let bin_center_px = bin_start_px + 0.5 * effective_bin_size;
-
-            bin_records.push(DisparityBinRecord {
-                bin_idx: b,
-                bin_start_px,
-                bin_end_px,
-                bin_center_px,
-                count: cnt,
-                fraction,
-                percentage,
-                cluster_id,
-                is_selected_surface,
-            });
-        }
+        let bin_records = build_disparity_histogram_records(
+            &bin_map,
+            &populated_bins,
+            &clusters,
+            target_cluster_idx,
+            data.len(),
+            effective_bin_size,
+        );
 
         let debug_data = DisparityHistogramData {
             bin_size: effective_bin_size,
@@ -707,8 +786,8 @@ impl WiggleAligner {
         tracing::info!(
             surface_points = cluster_triplet_indices.len(),
             total_triplets = data.len(),
-            shift_0 = ?shift_0,
-            shift_2 = ?shift_2,
+            shift_0 = ?shifts[0],
+            shift_2 = ?shifts[2],
             "Calculated depth surface cluster baseline alignment shifts"
         );
 
@@ -717,10 +796,10 @@ impl WiggleAligner {
             for &idx in &cluster_triplet_indices {
                 let d = &data[idx];
                 let diff = [
-                    d.dx_01 - shift_0.0,
-                    d.dy_01 - shift_0.1,
-                    d.dx_21 - shift_2.0,
-                    d.dy_21 - shift_2.1,
+                    d.dx_01 - shifts[0].0,
+                    d.dy_01 - shifts[0].1,
+                    d.dx_21 - shifts[2].0,
+                    d.dy_21 - shifts[2].1,
                 ];
                 var_accum[0] += diff[0] * diff[0];
                 var_accum[1] += diff[1] * diff[1];
@@ -836,16 +915,8 @@ impl WiggleAligner {
     /// * `cluster_tolerance` - Maximum gap between bins to belong to the same depth surface.
     #[must_use]
     #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::too_many_lines,
         clippy::imprecise_flops,
-        clippy::suboptimal_flops,
-        clippy::redundant_closure_for_method_calls,
-        clippy::single_match_else,
-        clippy::map_unwrap_or,
-        clippy::items_after_statements
+        clippy::suboptimal_flops
     )]
     pub fn compute_depth_surface_shifts_from_pairs(
         features: &[FeatureFrame],
@@ -868,72 +939,14 @@ impl WiggleAligner {
             DEFAULT_CLUSTER_TOLERANCE_PX
         };
 
-        let calculate_pair_surface_shift = |pair_matches: &[FeatureMatch],
-                                            f_src: &FeatureFrame,
-                                            f_ref: &FeatureFrame|
-         -> (f32, f32) {
-            struct MatchDisp {
-                dx: f32,
-                dy: f32,
-                inv_disp: f32,
-            }
-            let mut list = Vec::with_capacity(pair_matches.len());
-            for m in pair_matches {
-                if m.index_a < f_src.keypoints.len() && m.index_b < f_ref.keypoints.len() {
-                    let p_src = f_src.keypoints[m.index_a].point;
-                    let p_ref = f_ref.keypoints[m.index_b].point;
-                    let dx = p_ref.x - p_src.x;
-                    let dy = p_ref.y - p_src.y;
-                    let mag = (dx * dx + dy * dy).sqrt();
-                    if mag > MIN_DISPARITY_FOR_DEPTH_PX {
-                        let inv_disp = 1.0 / mag;
-                        list.push(MatchDisp { dx, dy, inv_disp });
-                    }
-                }
-            }
-
-            let Some(clustering) = HistogramClusteringResult::compute(
-                &list,
-                |item| item.inv_disp,
-                effective_bin_size,
-                effective_tolerance,
-            ) else {
-                return (0.0, 0.0);
-            };
-
-            let bin_map = clustering.bin_map;
-            let target_cluster = &clustering.clusters[clustering.target_cluster_idx];
-
-            let mut cluster_indices = Vec::new();
-            for &b in target_cluster {
-                if let Some(indices) = bin_map.get(&b) {
-                    cluster_indices.extend_from_slice(indices);
-                }
-            }
-
-            if cluster_indices.is_empty() {
-                return (0.0, 0.0);
-            }
-
-            let count = cluster_indices.len() as f32;
-            let mut sum_x = 0.0;
-            let mut sum_y = 0.0;
-            for &idx in &cluster_indices {
-                sum_x += list[idx].dx;
-                sum_y += list[idx].dy;
-            }
-
-            (sum_x / count, sum_y / count)
-        };
-
         let mut shift_0 = (0.0, 0.0);
         let mut shift_2 = (0.0, 0.0);
 
         for ((idx_a, idx_b), matches) in pairwise_matches {
             if *idx_a == 0 && *idx_b == 1 && !matches.is_empty() {
-                shift_0 = calculate_pair_surface_shift(matches, &features[0], &features[1]);
+                shift_0 = calculate_pair_surface_shift(matches, &features[0], &features[1], effective_bin_size, effective_tolerance);
             } else if *idx_a == 1 && *idx_b == 2 && !matches.is_empty() {
-                shift_2 = calculate_pair_surface_shift(matches, &features[2], &features[1]);
+                shift_2 = calculate_pair_surface_shift(matches, &features[2], &features[1], effective_bin_size, effective_tolerance);
             }
         }
 

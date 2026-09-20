@@ -174,11 +174,7 @@ impl ProgressObserver for NonTtyProgressObserver {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let is_tty = std::io::stderr().is_terminal() && !cli.no_progress && !cli.quiet;
-
+fn init_logging(cli: &Cli, is_tty: bool) -> Option<PathBuf> {
     let file_filter_directive = match cli.verbose {
         0 => {
             if cli.debug {
@@ -252,19 +248,14 @@ fn main() -> anyhow::Result<()> {
         .with(file_layer)
         .init();
 
-    // Front-end discovery & input validation
-    let files = collect_verified_images(&cli.input);
-    if files.is_empty() {
-        tracing::warn!(input = ?cli.input, "No valid image files found matching supported extensions");
-        return Ok(());
-    }
+    actual_log_file
+}
 
-    tracing::info!(
-        discovered_count = files.len(),
-        input = ?cli.input,
-        "Verified input files for processing"
-    );
-
+fn build_batch_request(
+    cli: &Cli,
+    files: Vec<PathBuf>,
+    is_tty: bool,
+) -> anyhow::Result<(BatchProcessingRequest, Option<ProgressBar>)> {
     let total_files = files.len();
     let gif_config = reto_core::WiggleGifConfig::new(cli.gif_delay).with_dither(!cli.no_dither);
     let video_config = if cli.enable_mp4 || cli.enable_nvenc {
@@ -273,7 +264,6 @@ fn main() -> anyhow::Result<()> {
             .with_crf(cli.mp4_crf)
             .with_nvenc(cli.enable_nvenc);
 
-        // Pre-flight availability check for video encoder backend before executing batch
         match reto_core::probe_video_encoder_backend(&v_cfg) {
             Ok(backend) => {
                 tracing::info!(
@@ -293,6 +283,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+
     let mut request = BatchProcessingRequest::new(files, cli.output.clone(), cli.debug)
         .with_gif_config(gif_config)
         .with_video_config(video_config);
@@ -307,36 +298,33 @@ fn main() -> anyhow::Result<()> {
             .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏");
         pb.set_style(style);
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
-        let observer = Arc::new(IndicatifObserver::new(pb.clone()));
-        request = request.with_progress_observer(observer);
+        request = request.with_progress_observer(Arc::new(IndicatifObserver::new(pb.clone())));
         Some(pb)
     } else if !cli.quiet && !cli.no_progress {
-        let observer = Arc::new(NonTtyProgressObserver::new());
-        request = request.with_progress_observer(observer);
+        request = request.with_progress_observer(Arc::new(NonTtyProgressObserver::new()));
         None
     } else {
         None
     };
 
-    let start_time = Instant::now();
-    let summary = run_batch(&request)?;
-    let elapsed = start_time.elapsed();
+    Ok((request, progress_bar))
+}
 
-    if let Some(pb) = progress_bar {
-        pb.finish_and_clear();
-    }
-
+fn print_summary(
+    cli: &Cli,
+    summary: &reto_core::ProcessSummary,
+    elapsed_secs: f64,
+    is_tty: bool,
+    actual_log_file: Option<&Path>,
+) {
     if !cli.quiet {
         let prefix = if is_tty { "✔ [OK]" } else { "[OK]" };
         println!(
             "{prefix} Processed {} images ({} succeeded, {} failed) in {:.1}s.",
-            summary.total_input,
-            summary.successful_count,
-            summary.failed_count,
-            elapsed.as_secs_f64()
+            summary.total_input, summary.successful_count, summary.failed_count, elapsed_secs
         );
         println!("  • Output Directory: {}", cli.output.display());
-        if let Some(ref log_file) = actual_log_file {
+        if let Some(log_file) = actual_log_file {
             println!("  • Execution Log:    {}", log_file.display());
         }
     }
@@ -348,8 +336,42 @@ fn main() -> anyhow::Result<()> {
             "Completed with some failures"
         );
     }
+}
 
-    // Release compiled SuperPoint and RetinaFace models from memory at program exit
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    let is_tty = std::io::stderr().is_terminal() && !cli.no_progress && !cli.quiet;
+    let actual_log_file = init_logging(&cli, is_tty);
+
+    let files = collect_verified_images(&cli.input);
+    if files.is_empty() {
+        tracing::warn!(input = ?cli.input, "No valid image files found matching supported extensions");
+        return Ok(());
+    }
+
+    tracing::info!(
+        discovered_count = files.len(),
+        input = ?cli.input,
+        "Verified input files for processing"
+    );
+
+    let (request, progress_bar) = build_batch_request(&cli, files, is_tty)?;
+    let start_time = Instant::now();
+    let summary = run_batch(&request)?;
+    let elapsed = start_time.elapsed();
+
+    if let Some(pb) = progress_bar {
+        pb.finish_and_clear();
+    }
+
+    print_summary(
+        &cli,
+        &summary,
+        elapsed.as_secs_f64(),
+        is_tty,
+        actual_log_file.as_deref(),
+    );
+
     clear_superpoint_model_cache();
     clear_retinaface_model_cache();
 

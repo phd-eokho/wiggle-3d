@@ -7,7 +7,7 @@ use crate::error::{FaceError, Result};
 use crate::feature::{ensure_model_cached, init_ort_environment_if_needed};
 use crate::geom::{NormalizedRect, Point2D, Size2D};
 use image::RgbImage;
-use ndarray::Array4;
+use ndarray::{Array4, ArrayViewD};
 use ort::session::Session;
 use ort::value::Tensor;
 use serde::{Deserialize, Serialize};
@@ -561,14 +561,92 @@ impl RetinaFaceDetector {
     }
 }
 
+struct AnchorDecodeContext {
+    pad_x_norm: f32,
+    pad_y_norm: f32,
+    content_scale_x: f32,
+    content_scale_y: f32,
+    var_0: f32,
+    var_1: f32,
+}
+
+#[inline]
+fn compute_face_score(c0: f32, c1: f32) -> f32 {
+    if (c0 + c1 - 1.0).abs() < 1e-3 && c0 >= 0.0 && c1 >= 0.0 {
+        c1
+    } else {
+        let max_c = c0.max(c1);
+        let exp0 = (c0 - max_c).exp();
+        let exp1 = (c1 - max_c).exp();
+        let sum_exp = exp0 + exp1;
+        if sum_exp > 0.0 {
+            exp1 / sum_exp
+        } else {
+            0.0
+        }
+    }
+}
+
+#[allow(clippy::suboptimal_flops, clippy::similar_names)]
+fn decode_candidate_at_anchor(
+    i: usize,
+    anchor: [f32; 4],
+    loc: &ArrayViewD<'_, f32>,
+    landmarks: &ArrayViewD<'_, f32>,
+    score: f32,
+    ctx: &AnchorDecodeContext,
+) -> Option<FaceDetection> {
+    let anchor_cx = anchor[0];
+    let anchor_cy = anchor[1];
+    let anchor_sx = anchor[2];
+    let anchor_sy = anchor[3];
+
+    let dx = loc[[0, i, 0]];
+    let dy = loc[[0, i, 1]];
+    let dw = loc[[0, i, 2]];
+    let dh = loc[[0, i, 3]];
+
+    let box_cx = anchor_cx + dx * ctx.var_0 * anchor_sx;
+    let box_cy = anchor_cy + dy * ctx.var_0 * anchor_sy;
+    let box_w = anchor_sx * (dw * ctx.var_1).exp();
+    let box_h = anchor_sy * (dh * ctx.var_1).exp();
+
+    let box_x = box_cx - (box_w * 0.5);
+    let box_y = box_cy - (box_h * 0.5);
+
+    let norm_x = ((box_x - ctx.pad_x_norm) * ctx.content_scale_x).clamp(0.0, 1.0);
+    let norm_y = ((box_y - ctx.pad_y_norm) * ctx.content_scale_y).clamp(0.0, 1.0);
+    let norm_w = (box_w * ctx.content_scale_x).min(1.0 - norm_x);
+    let norm_h = (box_h * ctx.content_scale_y).min(1.0 - norm_y);
+
+    if norm_w <= 1e-4 || norm_h <= 1e-4 {
+        return None;
+    }
+
+    let bbox = NormalizedRect::new(norm_x, norm_y, norm_w, norm_h).ok()?;
+
+    let mut face_landmarks = [Point2D::new(0.0, 0.0); 5];
+    for k in 0..5 {
+        let lx = landmarks[[0, i, k * 2]];
+        let ly = landmarks[[0, i, (k * 2) + 1]];
+
+        let lm_x = anchor_cx + lx * ctx.var_0 * anchor_sx;
+        let lm_y = anchor_cy + ly * ctx.var_0 * anchor_sy;
+
+        let unpad_lx = ((lm_x - ctx.pad_x_norm) * ctx.content_scale_x).clamp(0.0, 1.0);
+        let unpad_ly = ((lm_y - ctx.pad_y_norm) * ctx.content_scale_y).clamp(0.0, 1.0);
+        face_landmarks[k] = Point2D::new(unpad_lx, unpad_ly);
+    }
+
+    Some(FaceDetection::new(bbox, score, face_landmarks))
+}
+
 impl FaceDetector for RetinaFaceDetector {
     #[allow(
         clippy::significant_drop_tightening,
         clippy::similar_names,
         clippy::cast_precision_loss,
-        clippy::suboptimal_flops,
-        clippy::too_many_lines,
-        clippy::manual_let_else
+        clippy::suboptimal_flops
     )]
     fn detect_faces(&self, image: &RgbImage) -> Result<Vec<FaceDetection>> {
         let (input_tensor, (_scale, pad_x_norm, pad_y_norm, content_w_norm, content_h_norm)) =
@@ -610,14 +688,11 @@ impl FaceDetector for RetinaFaceDetector {
             .into());
         };
 
-        let (loc, conf, landmarks) = match (loc_arr, conf_arr, land_arr) {
-            (Ok(l), Ok(c), Ok(lm)) => (l, c, lm),
-            _ => {
-                return Err(FaceError::Inference(
-                    "Failed to extract float arrays from RetinaFace outputs".to_string(),
-                )
-                .into())
-            }
+        let (Ok(loc), Ok(conf), Ok(landmarks)) = (loc_arr, conf_arr, land_arr) else {
+            return Err(FaceError::Inference(
+                "Failed to extract float arrays from RetinaFace outputs".to_string(),
+            )
+            .into());
         };
 
         let num_anchors = self.model.anchors.len().min(loc.shape()[1]);
@@ -625,89 +700,42 @@ impl FaceDetector for RetinaFaceDetector {
         let var_0 = self.config.variances[0];
         let var_1 = self.config.variances[1];
 
-        let content_scale_x = if content_w_norm > 0.0 {
-            1.0 / content_w_norm
-        } else {
-            1.0
-        };
-        let content_scale_y = if content_h_norm > 0.0 {
-            1.0 / content_h_norm
-        } else {
-            1.0
+        let decode_ctx = AnchorDecodeContext {
+            pad_x_norm,
+            pad_y_norm,
+            content_scale_x: if content_w_norm > 0.0 {
+                1.0 / content_w_norm
+            } else {
+                1.0
+            },
+            content_scale_y: if content_h_norm > 0.0 {
+                1.0 / content_h_norm
+            } else {
+                1.0
+            },
+            var_0,
+            var_1,
         };
 
         for i in 0..num_anchors {
             let c0 = conf[[0, i, 0]];
             let c1 = conf[[0, i, 1]];
 
-            // Compute face score supporting both raw logits and pre-normalized probabilities
-            let score = if (c0 + c1 - 1.0).abs() < 1e-3 && c0 >= 0.0 && c1 >= 0.0 {
-                c1
-            } else {
-                let max_c = c0.max(c1);
-                let exp0 = (c0 - max_c).exp();
-                let exp1 = (c1 - max_c).exp();
-                let sum_exp = exp0 + exp1;
-                if sum_exp > 0.0 {
-                    exp1 / sum_exp
-                } else {
-                    0.0
-                }
-            };
-
+            let score = compute_face_score(c0, c1);
             if score < self.config.confidence_threshold {
                 continue;
             }
 
-            let anchor = self.model.anchors[i];
-            let anchor_cx = anchor[0];
-            let anchor_cy = anchor[1];
-            let anchor_sx = anchor[2];
-            let anchor_sy = anchor[3];
-
-            // Decode bounding box
-            let dx = loc[[0, i, 0]];
-            let dy = loc[[0, i, 1]];
-            let dw = loc[[0, i, 2]];
-            let dh = loc[[0, i, 3]];
-
-            let box_cx = anchor_cx + dx * var_0 * anchor_sx;
-            let box_cy = anchor_cy + dy * var_0 * anchor_sy;
-            let box_w = anchor_sx * (dw * var_1).exp();
-            let box_h = anchor_sy * (dh * var_1).exp();
-
-            let box_x = box_cx - (box_w * 0.5);
-            let box_y = box_cy - (box_h * 0.5);
-
-            // Unpad and scale back to source image normalized coordinates
-            let norm_x = ((box_x - pad_x_norm) * content_scale_x).clamp(0.0, 1.0);
-            let norm_y = ((box_y - pad_y_norm) * content_scale_y).clamp(0.0, 1.0);
-            let norm_w = (box_w * content_scale_x).min(1.0 - norm_x);
-            let norm_h = (box_h * content_scale_y).min(1.0 - norm_y);
-
-            if norm_w <= 1e-4 || norm_h <= 1e-4 {
-                continue;
+            if let Some(candidate) = decode_candidate_at_anchor(
+                i,
+                self.model.anchors[i],
+                &loc,
+                &landmarks,
+                score,
+                &decode_ctx,
+            ) {
+                candidates.push(candidate);
             }
-
-            let Ok(bbox) = NormalizedRect::new(norm_x, norm_y, norm_w, norm_h) else {
-                continue;
-            };
-
-            // Decode 5 landmarks
-            let mut face_landmarks = [Point2D::new(0.0, 0.0); 5];
-            for k in 0..5 {
-                let lx = landmarks[[0, i, k * 2]];
-                let ly = landmarks[[0, i, (k * 2) + 1]];
-
-                let lm_x = anchor_cx + lx * var_0 * anchor_sx;
-                let lm_y = anchor_cy + ly * var_0 * anchor_sy;
-
-                let unpad_lx = ((lm_x - pad_x_norm) * content_scale_x).clamp(0.0, 1.0);
-                let unpad_ly = ((lm_y - pad_y_norm) * content_scale_y).clamp(0.0, 1.0);
-                face_landmarks[k] = Point2D::new(unpad_lx, unpad_ly);
-            }
-
-            candidates.push(FaceDetection::new(bbox, score, face_landmarks));
         }
 
         Ok(Self::apply_nms(candidates, self.config.nms_threshold))

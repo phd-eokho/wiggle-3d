@@ -232,11 +232,136 @@ impl AxisStatisticsProfile {
             .map(|s| s.p98.saturating_sub(s.p5))
             .collect()
     }
+}
 
-    /// Finds the optimal regular $(N-1)$ gutter divider grid by directly minimizing gutter contrast energy.
-    ///
-    /// Evaluates candidate $(`x_0`, S)$ grid configurations and finds the configuration that minimizes
-    /// the integrated contrast dynamic range $P_{98} - `P_5`$ across all $N-1$ physical camera divider valleys.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn find_gutter_spans(
+    diffs: &[u8],
+    l: usize,
+    n: usize,
+    nominal_pitch: f32,
+) -> (Vec<u32>, Vec<GutterSpan>, f32) {
+    let search_radius = ((nominal_pitch * 0.12).round() as usize).max(8);
+    let max_gutter_half = ((nominal_pitch * 0.04).round() as usize).max(4);
+
+    let mut gutters = Vec::with_capacity(n - 1);
+    let mut gutter_centers = Vec::with_capacity(n - 1);
+    let mut total_score = 0.0_f32;
+
+    for k in 1..n {
+        let nominal_center = ((k as f32) * nominal_pitch).round() as usize;
+        let s = nominal_center.saturating_sub(search_radius);
+        let e = (nominal_center + search_radius + 1).min(l);
+
+        let mut min_idx = nominal_center;
+        let mut min_val = u8::MAX;
+        for (idx, &val) in diffs[s..e].iter().enumerate() {
+            if val < min_val {
+                min_val = val;
+                min_idx = s + idx;
+            }
+        }
+
+        let edge_thresh = (f32::from(min_val) + 12.0).min(32.0);
+
+        let mut g_start = min_idx;
+        while g_start > nominal_center.saturating_sub(max_gutter_half)
+            && g_start > 0
+            && f32::from(diffs[g_start - 1]) <= edge_thresh
+        {
+            g_start -= 1;
+        }
+
+        let mut g_end = min_idx;
+        while g_end + 1 < (nominal_center + max_gutter_half).min(l)
+            && f32::from(diffs[g_end + 1]) <= edge_thresh
+        {
+            g_end += 1;
+        }
+
+        if g_end <= g_start {
+            let default_half = ((nominal_pitch * 0.01).round() as usize).max(2);
+            g_start = min_idx.saturating_sub(default_half);
+            g_end = (min_idx + default_half).min(l - 1);
+        }
+
+        gutter_centers.push(min_idx as u32);
+        gutters.push(GutterSpan {
+            center: min_idx as u32,
+            start: g_start as u32,
+            end: g_end as u32,
+            width: (g_end - g_start + 1) as u32,
+        });
+        total_score += f32::from(min_val);
+    }
+
+    (gutter_centers, gutters, total_score)
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn find_scan_margins(
+    stats: &[AxisPixelStats],
+    l: usize,
+    nominal_pitch: f32,
+    avg_gutter_min: f32,
+) -> (usize, usize) {
+    let margin_thresh = (avg_gutter_min + 6.0).min(24.0);
+    let margin_max = ((nominal_pitch * 0.03).round() as usize).max(2);
+
+    let mut margin_start = 0_usize;
+    while margin_start < margin_max
+        && f32::from(stats[margin_start].p98.saturating_sub(stats[margin_start].p5)) <= margin_thresh
+    {
+        margin_start += 1;
+    }
+
+    let mut margin_end = l.saturating_sub(1);
+    while margin_end > l.saturating_sub(margin_max)
+        && f32::from(stats[margin_end].p98.saturating_sub(stats[margin_end].p5)) <= margin_thresh
+    {
+        margin_end -= 1;
+    }
+
+    (margin_start, margin_end)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn compute_active_frame_spans(
+    n: usize,
+    margin_start: usize,
+    margin_end: usize,
+    gutters: &[GutterSpan],
+) -> Vec<(u32, u32)> {
+    let mut frame_spans = Vec::with_capacity(n);
+    for i in 0..n {
+        let f_start = if i == 0 {
+            margin_start as u32
+        } else {
+            gutters[i - 1].end + 1
+        };
+
+        let f_end = if i == n - 1 {
+            margin_end as u32
+        } else {
+            gutters[i].start.saturating_sub(1)
+        };
+
+        let f_len = (f_end.saturating_sub(f_start) + 1).max(10);
+        frame_spans.push((f_start, f_len));
+    }
+    frame_spans
+}
+
+impl AxisStatisticsProfile {
+    /// Estimates optimal equi-spaced film sub-frame divider grid using median-trough alignment.
     ///
     /// # Arguments
     /// * `expected_frames` - Number of expected film frames $N$ (e.g. 3 for RETO3D Classic, 4 for N4).
@@ -244,9 +369,7 @@ impl AxisStatisticsProfile {
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::needless_range_loop,
-        clippy::too_many_lines
+        clippy::cast_sign_loss
     )]
     pub fn find_optimal_grid(&self, expected_frames: usize) -> Option<OptimalGridResult> {
         if expected_frames < 2 || self.stats.len() < expected_frames * 20 {
@@ -257,114 +380,15 @@ impl AxisStatisticsProfile {
         let n = expected_frames;
         let nominal_pitch = l as f32 / n as f32;
 
-        // Search radius around each nominal divider k * (L / N): +-12% of pitch
-        let search_radius = ((nominal_pitch * 0.12).round() as usize).max(8);
-        let max_gutter_half = ((nominal_pitch * 0.04).round() as usize).max(4);
-
         let diffs = self.p98_minus_p5_series();
-        let mut gutters = Vec::with_capacity(n - 1);
-        let mut gutter_centers = Vec::with_capacity(n - 1);
-        let mut total_score = 0.0_f32;
-
-        for k in 1..n {
-            let nominal_center = ((k as f32) * nominal_pitch).round() as usize;
-
-            // Search for local minimum in bounded partition window [nominal - radius .. nominal + radius]
-            let s = nominal_center.saturating_sub(search_radius);
-            let e = (nominal_center + search_radius + 1).min(l);
-
-            let mut min_idx = nominal_center;
-            let mut min_val = u8::MAX;
-            for idx in s..e {
-                let val = diffs[idx];
-                if val < min_val {
-                    min_val = val;
-                    min_idx = idx;
-                }
-            }
-
-            // Gutter edge threshold is strictly relative to the trough floor (never leaking into active frames)
-            let edge_thresh = (f32::from(min_val) + 12.0).min(32.0);
-
-            // Expand boundaries around selected center
-            let mut g_start = min_idx;
-            while g_start > nominal_center.saturating_sub(max_gutter_half)
-                && g_start > 0
-                && f32::from(diffs[g_start - 1]) <= edge_thresh
-            {
-                g_start -= 1;
-            }
-
-            let mut g_end = min_idx;
-            while g_end + 1 < (nominal_center + max_gutter_half).min(l)
-                && f32::from(diffs[g_end + 1]) <= edge_thresh
-            {
-                g_end += 1;
-            }
-
-            // Ensure gutter has at least minimal valid span
-            if g_end <= g_start {
-                let default_half = ((nominal_pitch * 0.01).round() as usize).max(2);
-                g_start = min_idx.saturating_sub(default_half);
-                g_end = (min_idx + default_half).min(l - 1);
-            }
-
-            gutter_centers.push(min_idx as u32);
-            gutters.push(GutterSpan {
-                center: min_idx as u32,
-                start: g_start as u32,
-                end: g_end as u32,
-                width: (g_end - g_start + 1) as u32,
-            });
-            total_score += f32::from(min_val);
-        }
+        let (gutter_centers, gutters, total_score) =
+            find_gutter_spans(&diffs, l, n, nominal_pitch);
 
         let avg_gutter_min = total_score / (n - 1) as f32;
-        let margin_thresh = (avg_gutter_min + 6.0).min(24.0);
+        let (margin_start, margin_end) =
+            find_scan_margins(&self.stats, l, nominal_pitch, avg_gutter_min);
 
-        // Scan outer left and right scan margins (only if genuine black border)
-        let margin_max = ((nominal_pitch * 0.03).round() as usize).max(2);
-        let mut margin_start = 0_usize;
-        while margin_start < margin_max
-            && f32::from(
-                self.stats[margin_start]
-                    .p98
-                    .saturating_sub(self.stats[margin_start].p5),
-            ) <= margin_thresh
-        {
-            margin_start += 1;
-        }
-
-        let mut margin_end = l.saturating_sub(1);
-        while margin_end > l.saturating_sub(margin_max)
-            && f32::from(
-                self.stats[margin_end]
-                    .p98
-                    .saturating_sub(self.stats[margin_end].p5),
-            ) <= margin_thresh
-        {
-            margin_end -= 1;
-        }
-
-        // Compute individual active frame pixel spans (excluding black gutters)
-        let mut frame_spans = Vec::with_capacity(n);
-        for i in 0..n {
-            let f_start = if i == 0 {
-                margin_start as u32
-            } else {
-                gutters[i - 1].end + 1
-            };
-
-            let f_end = if i == n - 1 {
-                margin_end as u32
-            } else {
-                gutters[i].start.saturating_sub(1)
-            };
-
-            let f_len = (f_end.saturating_sub(f_start) + 1).max(10);
-            frame_spans.push((f_start, f_len));
-        }
-
+        let frame_spans = compute_active_frame_spans(n, margin_start, margin_end, &gutters);
         let quality_score = total_score / (n - 1) as f32;
 
         Some(OptimalGridResult {
@@ -376,7 +400,91 @@ impl AxisStatisticsProfile {
             score: quality_score,
         })
     }
+}
 
+type ThresholdRun = (bool, usize, usize);
+type ThresholdResult = (u8, Vec<ThresholdRun>);
+
+#[inline]
+fn run_length_threshold(diffs: &[u8], t: u8) -> Vec<ThresholdRun> {
+    if diffs.is_empty() {
+        return Vec::new();
+    }
+    let mut runs = Vec::new();
+    let mut curr_val = diffs[0] >= t;
+    let mut curr_start = 0_usize;
+    let mut curr_len = 1_usize;
+
+    for (i, &val) in diffs.iter().enumerate().skip(1) {
+        let is_image = val >= t;
+        if is_image == curr_val {
+            curr_len += 1;
+        } else {
+            runs.push((curr_val, curr_start, curr_len));
+            curr_val = is_image;
+            curr_start = i;
+            curr_len = 1;
+        }
+    }
+    runs.push((curr_val, curr_start, curr_len));
+    runs
+}
+
+fn validate_threshold_runs(
+    runs: &[ThresholdRun],
+    n: usize,
+    min_frame_w: usize,
+    max_frame_w: usize,
+    min_gutter_w: usize,
+    max_gutter_w: usize,
+) -> bool {
+    if runs.len() != 2 * n - 1 {
+        return false;
+    }
+    for (i, &(is_img, _s, length)) in runs.iter().enumerate() {
+        if i % 2 == 0 {
+            if !is_img || length < min_frame_w || length > max_frame_w {
+                return false;
+            }
+        } else if is_img || length < min_gutter_w || length > max_gutter_w {
+            return false;
+        }
+    }
+    true
+}
+
+fn select_plateau_runs(
+    valid_thresholds: &[ThresholdResult],
+) -> Option<ThresholdResult> {
+    let mut plateau_counts: std::collections::HashMap<Vec<usize>, usize> =
+        std::collections::HashMap::new();
+    for (_, runs) in valid_thresholds {
+        let signature: Vec<usize> = runs.iter().map(|r| r.2).collect();
+        *plateau_counts.entry(signature).or_insert(0) += 1;
+    }
+
+    let stable_signatures: Vec<Vec<usize>> = plateau_counts
+        .iter()
+        .filter(|&(_, &count)| count >= 3)
+        .map(|(sig, _)| sig.clone())
+        .collect();
+
+    if stable_signatures.is_empty() {
+        let (most_frequent_sig, _) =
+            plateau_counts.into_iter().max_by_key(|&(_, count)| count)?;
+        valid_thresholds.iter().find(|&(_, runs)| {
+            let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
+            sig == most_frequent_sig
+        }).cloned()
+    } else {
+        valid_thresholds.iter().find(|&(_, runs)| {
+            let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
+            stable_signatures.contains(&sig)
+        }).cloned()
+    }
+}
+
+impl AxisStatisticsProfile {
     /// Finds the maximum contrast threshold that decomposes the profile into exactly $2N-1$
     /// consecutive alternating regions (Image, Gutter, Image, ..., Image).
     ///
@@ -389,8 +497,7 @@ impl AxisStatisticsProfile {
     #[allow(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::too_many_lines
+        clippy::cast_sign_loss
     )]
     pub fn find_threshold_partition(
         &self,
@@ -406,7 +513,6 @@ impl AxisStatisticsProfile {
 
         let min_frame_w = (nominal_pitch * 0.65).round() as usize;
         let max_frame_w = (nominal_pitch * 1.35).round() as usize;
-        // Physical gutter width on 35mm film scan is at least ~0.8% of frame pitch (minimum 4px)
         let min_gutter_w = ((nominal_pitch * 0.008).round() as usize).max(4);
         let max_gutter_w = ((nominal_pitch * 0.10).round() as usize).max(8);
 
@@ -420,50 +526,10 @@ impl AxisStatisticsProfile {
         let p80_idx = (l * 4) / 5;
         let (_, &mut max_d, _) = sample_diffs.select_nth_unstable(p80_idx);
 
-        let check_threshold = |t: u8| -> Option<Vec<(bool, usize, usize)>> {
-            let mut runs = Vec::new();
-            let mut curr_val = diffs[0] >= t;
-            let mut curr_start = 0_usize;
-            let mut curr_len = 1_usize;
-
-            for (i, &val) in diffs.iter().enumerate().skip(1) {
-                let is_image = val >= t;
-                if is_image == curr_val {
-                    curr_len += 1;
-                } else {
-                    runs.push((curr_val, curr_start, curr_len));
-                    curr_val = is_image;
-                    curr_start = i;
-                    curr_len = 1;
-                }
-            }
-            runs.push((curr_val, curr_start, curr_len));
-
-            if runs.len() != 2 * n - 1 {
-                return None;
-            }
-
-            for (i, &(is_img, _s, length)) in runs.iter().enumerate() {
-                if i % 2 == 0 {
-                    // Image region
-                    if !is_img || length < min_frame_w || length > max_frame_w {
-                        return None;
-                    }
-                } else {
-                    // Gutter region
-                    if is_img || length < min_gutter_w || length > max_gutter_w {
-                        return None;
-                    }
-                }
-            }
-
-            Some(runs)
-        };
-
         let mut valid_thresholds = Vec::new();
-
         for t in (min_d + 1)..=max_d {
-            if let Some(runs) = check_threshold(t) {
+            let runs = run_length_threshold(&diffs, t);
+            if validate_threshold_runs(&runs, n, min_frame_w, max_frame_w, min_gutter_w, max_gutter_w) {
                 valid_thresholds.push((t, runs));
             }
         }
@@ -476,36 +542,7 @@ impl AxisStatisticsProfile {
         let t_max = valid_thresholds.last()?.0;
         let t_span = f32::from(t_max.saturating_sub(t_min) + 1);
 
-        // Group valid thresholds into plateaus where region widths are completely unchanged
-        let mut plateau_counts: std::collections::HashMap<Vec<usize>, usize> =
-            std::collections::HashMap::new();
-        for (_, runs) in &valid_thresholds {
-            let signature: Vec<usize> = runs.iter().map(|r| r.2).collect();
-            *plateau_counts.entry(signature).or_insert(0) += 1;
-        }
-
-        // Find candidate stable plateaus (length >= 3 threshold levels)
-        let stable_signatures: Vec<Vec<usize>> = plateau_counts
-            .iter()
-            .filter(|&(_, &count)| count >= 3)
-            .map(|(sig, _)| sig.clone())
-            .collect();
-
-        // If stable plateaus exist, choose the lowest threshold among them; otherwise use the most frequent plateau
-        let (chosen_t, chosen_runs) = if stable_signatures.is_empty() {
-            let (most_frequent_sig, _) =
-                plateau_counts.into_iter().max_by_key(|&(_, count)| count)?;
-            valid_thresholds.into_iter().find(|(_, runs)| {
-                let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
-                sig == most_frequent_sig
-            })?
-        } else {
-            valid_thresholds.into_iter().find(|(_, runs)| {
-                let sig: Vec<usize> = runs.iter().map(|r| r.2).collect();
-                stable_signatures.contains(&sig)
-            })?
-        };
-
+        let (chosen_t, chosen_runs) = select_plateau_runs(&valid_thresholds)?;
         let dynamic_range = (median_d - f32::from(min_d)).max(1.0);
         let confidence = (t_span / dynamic_range * 2.0).clamp(0.0, 1.0);
 
