@@ -41,6 +41,7 @@ samples/
 *.avif
 *.dng
 *.raw
+*.mp4
 !assets/**
 
 # Model cache

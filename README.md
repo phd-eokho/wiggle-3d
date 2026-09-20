@@ -40,6 +40,7 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 - **Intelligent Facial Detection & Focal Locking**: Automatically identifies human subjects and facial landmarks from the user's perspective, locking the stereoscopic focal plane onto faces so the main subject remains sharp, stable, and perfectly anchored.
 - **Automated Frame Splitting**: Automatically detects sub-frame boundaries on raw film strips, eliminating tedious manual cropping.
 - **Flicker-Free Unified Palette Quantization**: Computes a global 256-color palette across all frames with Floyd-Steinberg dithering to prevent color flashing between loop frames.
+- **Native 24-bit TrueColor HEVC MP4 Video Export**: Generates high-efficiency 24-bit TrueColor H.265 (HEVC) MP4 videos with variable $\mathrm{SE}(3)$ timing preservation alongside standard animated GIFs.
 - **Diagnostic Visual Overlays**: Generates visual debug artifacts including RoI boundary boxes, facial landmark points, and epipolar match vectors when run with `--debug`.
 
 ---
@@ -55,7 +56,7 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
 
-For NVIDIA GPU acceleration (CUDA):
+For NVIDIA GPU acceleration (CUDA & NVENC):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
@@ -70,7 +71,7 @@ curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh
 irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
 ```
 
-For NVIDIA GPU acceleration (CUDA):
+For NVIDIA GPU acceleration (CUDA & NVENC):
 ```powershell
 $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1 | iex
 ```
@@ -92,9 +93,14 @@ cargo build --release
 
 ### Basic Usage
 
-#### Process a Single Scan File
+#### Process a Single Scan File (GIF Output)
 ```bash
 reto-cli --input samples/film_strip_01.jpg --output output_dir/
+```
+
+#### Process with 24-bit TrueColor HEVC MP4 Video Export
+```bash
+reto-cli --input samples/ --output results/ --enable-mp4
 ```
 
 #### Batch Process an Entire Directory
@@ -122,14 +128,23 @@ reto-cli [OPTIONS] --input <PATH> --output <DIR>
 | Option / Flag | Type / Default | Description |
 | :--- | :--- | :--- |
 | `-i, --input <PATH>` | `Path` (Required) | Path to an individual scan file or a directory of scans. |
-| `-o, --output <DIR>` | `Path` (Required) | Destination directory for output GIFs and diagnostic artifacts. |
+| `-o, --output <DIR>` | `Path` (Required) | Destination directory for output GIFs, MP4 videos, and diagnostic artifacts. |
 | `--debug` | `bool` (Flag) | Enables intermediate debug outputs (RoI overlays, matched features, disparity logs). |
 | `--gif-delay <MS>` | `u32` (Default: `100`) | Inter-frame animation delay in milliseconds (100ms = 10 fps). |
 | `--no-dither` | `bool` (Flag) | Disables Floyd-Steinberg dithering during NeuQuant color quantization. |
+| `--enable-mp4` | `bool` (Flag) | Enables native 24-bit TrueColor HEVC (H.265) MP4 video export alongside GIF. |
+| `--enable-nvenc` | `bool` (Flag) | Forces NVIDIA NVENC hardware acceleration for HEVC MP4 video generation. |
+| `--mp4-loops <COUNT>` | `usize` (Default: `4`) | Number of continuous ping-pong wiggle loop cycles encoded into the MP4 video. |
+| `--mp4-crf <CRF>` | `u32` (Default: `18`) | Constant Rate Factor for HEVC video encoding (0–51, lower means higher quality). |
 | `--no-progress` | `bool` (Flag) | Disables interactive terminal progress bar (recommended for CI/headless logs). |
 | `--log-file <FILE>` | `Path` (Optional) | Custom file destination for detailed trace and diagnostic logs. |
 | `-q, --quiet` | `bool` (Flag) | Suppresses all console output except fatal errors. |
 | `-v, -vv` | `Count` (Flag) | Increases verbosity level (`-v` for DEBUG, `-vv` for TRACE). |
+
+> [!WARNING]
+> **Hardware Video Encoder Status:**
+> - **NVIDIA NVENC (Linux / Windows)**: Fully tested and verified on live GPU hardware.
+> - **Linux VA-API, macOS VideoToolbox, Windows Media Foundation**: Architecture and platform interfaces are implemented, but **have NOT been tested on physical hardware yet (experimental)**. When `--enable-mp4` is specified, the CLI probes available hardware backends prior to batch processing and fails fast if no supported hardware encoder is operational.
 
 ### Supported Image Formats
 

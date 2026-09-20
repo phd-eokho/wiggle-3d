@@ -1,10 +1,9 @@
 //! `RoI` detection traits, configuration, diagnostic taps, and baseline detectors.
 
+use crate::color::Bt709LumaConverter;
 use crate::error::RoiError;
 use crate::geom::{FrameRoi, FrameRoiSet, NormalizedRect, StripOrientation};
-use crate::luma::{
-    Bt709LumaConverter, ScaledLumaImage, DEFAULT_INVERSE_GAMMA, PROJECTION_MAX_DIMENSION,
-};
+use crate::luma::{ScaledLumaImage, DEFAULT_INVERSE_GAMMA, PROJECTION_MAX_DIMENSION};
 use crate::stats::AxisStatisticsProfile;
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};

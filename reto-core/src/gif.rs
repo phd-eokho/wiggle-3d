@@ -1064,11 +1064,8 @@ impl ColorMap for NeuQuantColorMap {
 
 /// Wiggle 3D GIF builder with global multi-frame palette quantization and dithering.
 ///
-/// # TODO (Modern Video Container & Codec Support)
-/// GIF format is constrained to an 8-bit indexed palette (256 colors) and large file sizes.
-/// Add native video export targets: MP4 (H.264 / H.265 / AV1) and WebM (VP9 / AV1) with full 24-bit
-/// RGB/RGBA true color depth and significantly reduced file sizes, as well as Animated PNG (APNG)
-/// for lossless 24-bit animated web presentation without color quantization artifacts.
+/// For 24-bit TrueColor export without 8-bit palette limitations, see [`crate::video::WiggleVideoBuilder`]
+/// for hardware-accelerated HEVC (H.265) MP4 video generation.
 pub struct WiggleGifBuilder;
 
 impl WiggleGifBuilder {

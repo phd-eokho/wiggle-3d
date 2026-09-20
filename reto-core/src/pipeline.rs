@@ -3,12 +3,13 @@
 //! Exposes supported format metadata and batch processing operations while leaving
 //! front-end file discovery and path verification to callers (CLI, TUI).
 
+use crate::color::Bt709LumaConverter;
 use crate::detector::{PillarStatsDetector, RoiDetectionConfig, RoiDetector};
 use crate::error::Result;
 use crate::face::RetinaFaceDetector;
 use crate::feature::AlignmentDiagnosticTap;
 use crate::geom::FrameRoiSet;
-use crate::luma::{Bt709LumaConverter, ScaledLumaImage, PROJECTION_MAX_DIMENSION};
+use crate::luma::{ScaledLumaImage, PROJECTION_MAX_DIMENSION};
 use crate::visualizer::RoiVisualizer;
 use image::{DynamicImage, Rgba};
 use std::path::{Path, PathBuf};
@@ -73,6 +74,8 @@ pub struct ImageItemContext {
     device: crate::feature::BackendDevice,
     /// Configuration for Wiggle GIF generation.
     gif_config: crate::gif::WiggleGifConfig,
+    /// Optional configuration for HEVC MP4 video generation.
+    video_config: Option<crate::video::WiggleVideoConfig>,
     /// Whether debug visualization mode is enabled.
     debug: bool,
 }
@@ -94,6 +97,7 @@ impl ImageItemContext {
             features: None,
             device: crate::feature::BackendDevice::Auto,
             gif_config: crate::gif::WiggleGifConfig::new(crate::gif::DEFAULT_FRAME_DELAY_MS),
+            video_config: None,
             debug: false,
         }
     }
@@ -216,6 +220,30 @@ impl ImageItemContext {
         self.gif_config = gif_config;
     }
 
+    /// Returns the optional HEVC MP4 video generation configuration.
+    #[must_use]
+    pub const fn video_config(&self) -> Option<crate::video::WiggleVideoConfig> {
+        self.video_config
+    }
+
+    /// Sets the HEVC MP4 video generation configuration.
+    pub const fn set_video_config(
+        &mut self,
+        video_config: Option<crate::video::WiggleVideoConfig>,
+    ) {
+        self.video_config = video_config;
+    }
+
+    /// Builder method to set HEVC MP4 video generation configuration.
+    #[must_use]
+    pub const fn with_video_config(
+        mut self,
+        video_config: Option<crate::video::WiggleVideoConfig>,
+    ) -> Self {
+        self.video_config = video_config;
+        self
+    }
+
     /// Returns whether debug visualization mode is enabled.
     #[must_use]
     pub const fn debug(&self) -> bool {
@@ -289,6 +317,8 @@ pub struct BatchProcessingRequest {
     pub device: crate::feature::BackendDevice,
     /// Configuration for Wiggle GIF generation.
     pub gif_config: crate::gif::WiggleGifConfig,
+    /// Optional configuration for HEVC MP4 video generation.
+    pub video_config: Option<crate::video::WiggleVideoConfig>,
     /// Optional observer for receiving progress notifications.
     pub progress_observer: Option<std::sync::Arc<dyn ProgressObserver>>,
 }
@@ -308,6 +338,7 @@ impl BatchProcessingRequest {
             debug,
             device: crate::feature::BackendDevice::Auto,
             gif_config: crate::gif::WiggleGifConfig::new(crate::gif::DEFAULT_FRAME_DELAY_MS),
+            video_config: None,
             progress_observer: None,
         }
     }
@@ -324,6 +355,22 @@ impl BatchProcessingRequest {
     pub const fn with_gif_config(mut self, gif_config: crate::gif::WiggleGifConfig) -> Self {
         self.gif_config = gif_config;
         self
+    }
+
+    /// Sets the HEVC MP4 video generation configuration.
+    #[must_use]
+    pub const fn with_video_config(
+        mut self,
+        video_config: Option<crate::video::WiggleVideoConfig>,
+    ) -> Self {
+        self.video_config = video_config;
+        self
+    }
+
+    /// Returns the HEVC MP4 video generation configuration, if enabled.
+    #[must_use]
+    pub const fn video_config(&self) -> Option<crate::video::WiggleVideoConfig> {
+        self.video_config
     }
 
     /// Attaches a progress observer to receive batch processing execution events.
@@ -345,6 +392,7 @@ impl BatchProcessingRequest {
                 let mut ctx = ImageItemContext::new(path.clone(), self.output_dir.clone());
                 ctx.set_device(self.device);
                 ctx.set_gif_config(self.gif_config);
+                ctx.set_video_config(self.video_config);
                 ctx.set_debug(self.debug);
                 ctx
             })
@@ -539,10 +587,11 @@ struct AlignedStagePayload {
     aligned_frames: Option<Vec<image::RgbaImage>>,
 }
 
-/// Intermediate payload produced by Stage 3 (NeuQuant color quantization and GIF byte serialization).
+/// Intermediate payload produced by Stage 3 (color quantization, GIF encoding, and optional HEVC MP4 video generation).
 struct EncodedStagePayload {
     item: ImageItemContext,
     gif_output: Option<(PathBuf, Vec<u8>)>,
+    video_output: Option<(PathBuf, Vec<u8>)>,
 }
 
 /// Stage 1: Ingestion, format decoding, scaled luma generation, and RoI detection.
@@ -709,7 +758,7 @@ fn stage_vision_and_align(mut payload: VisionStagePayload) -> Result<AlignedStag
     })
 }
 
-/// Stage 3: In-memory NeuQuant color quantization and GIF byte stream encoding.
+/// Stage 3: In-memory NeuQuant color quantization, GIF byte serialization, and optional MP4 video encoding.
 fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<EncodedStagePayload> {
     let gif_output = if let Some(ref aligned_frames) = payload.aligned_frames {
         let gif_path = payload
@@ -726,20 +775,42 @@ fn stage_quantize_and_encode(mut payload: AlignedStagePayload) -> Result<Encoded
         None
     };
 
+    let video_output = if let (Some(ref aligned_frames), Some(video_cfg)) =
+        (&payload.aligned_frames, payload.item.video_config())
+    {
+        let video_path = payload
+            .output_dir
+            .join(format!("{}_wiggle.mp4", payload.file_stem));
+        let mut video_bytes = Vec::new();
+        crate::video::WiggleVideoBuilder::build_wiggle_video(
+            aligned_frames,
+            &video_cfg,
+            &mut video_bytes,
+        )?;
+        Some((video_path, video_bytes))
+    } else {
+        None
+    };
+
     payload.item.set_image(payload.dynamic_img);
     payload.item.set_rois(payload.rois);
 
     Ok(EncodedStagePayload {
         item: payload.item,
         gif_output,
+        video_output,
     })
 }
 
-/// Stage 4: Disk writer that writes serialized GIF bytes and completes image item processing.
+/// Stage 4: Disk writer that persists serialized GIF / MP4 bytes and completes image item processing.
 fn stage_write_output(payload: EncodedStagePayload) -> Result<ImageItemContext> {
     if let Some((gif_path, gif_bytes)) = payload.gif_output {
         std::fs::write(&gif_path, gif_bytes)?;
         tracing::info!(gif_path = ?gif_path, "Saved Wiggle 3D GIF");
+    }
+    if let Some((video_path, video_bytes)) = payload.video_output {
+        std::fs::write(&video_path, video_bytes)?;
+        tracing::info!(video_path = ?video_path, "Saved Wiggle 3D TrueColor HEVC MP4 video");
     }
     tracing::info!(file = ?payload.item.source_path(), "Processed image item successfully");
     Ok(payload.item)
@@ -808,6 +879,16 @@ pub fn run_batch(request: &BatchProcessingRequest) -> Result<ProcessSummary> {
 
     let config = RoiDetectionConfig::default();
     let total_input = request.files.len();
+
+    // Early pre-flight availability check for MP4 video encoder backend if video export is requested
+    if let Some(ref video_cfg) = request.video_config() {
+        let backend = crate::video::probe_video_encoder_backend(video_cfg).map_err(|e| {
+            crate::error::Error::Unknown(format!(
+                "MP4 video export requested, but no available HEVC video encoder backend was found on this host: {e}"
+            ))
+        })?;
+        tracing::info!(backend = %backend, "Validated hardware HEVC MP4 video encoder backend before batch processing");
+    }
 
     tracing::info!(
         batch_size = total_input,

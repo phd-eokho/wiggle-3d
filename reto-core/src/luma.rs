@@ -3,10 +3,8 @@
 use crate::error::RoiError;
 use crate::geom::StripOrientation;
 use image::{GenericImageView, Pixel};
-use ndarray::{self, arr1, Array1, ArrayView2};
 use num_traits::ToPrimitive;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
 
 /// Target minor (shortest) dimension when downscaling for fast projection analysis (e.g. 1080px).
 pub const PROJECTION_MAX_DIMENSION: u32 = 1080;
@@ -20,145 +18,7 @@ pub const DEFAULT_CROSS_PERCENTILE: f32 = 0.05;
 /// Default baseline percentile rank across major axis slice profiles (1st percentile = 0.01).
 pub const DEFAULT_PROFILE_PERCENTILE: f32 = 0.01;
 
-/// Interface contract for converting RGB color components to scalar luma / grayscale intensity.
-pub trait LumaConverter: Send + Sync {
-    /// 3-element channel linear weight vector `[W_r, W_g, W_b]` for matrix / dot product computations.
-    fn weights(&self) -> [f32; 3];
-
-    /// Converts 8-bit RGB color channels to a scalar 8-bit luma intensity in `[0, 255]` via dot product.
-    ///
-    /// # Arguments
-    /// * `r` - Red channel `[0, 255]`.
-    /// * `g` - Green channel `[0, 255]`.
-    /// * `b` - Blue channel `[0, 255]`.
-    #[inline]
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::suboptimal_flops
-    )]
-    fn rgb_to_luma(&self, r: u8, g: u8, b: u8) -> u8 {
-        let w = self.weights();
-        (w[0] * f32::from(r) + w[1] * f32::from(g) + w[2] * f32::from(b))
-            .round()
-            .clamp(0.0, 255.0) as u8
-    }
-
-    /// Vectorized conversion of an `[N, 3]` RGB float tensor to a 1D `[N]` luma tensor using matrix-vector multiplication ($Y = X \cdot W$).
-    #[must_use]
-    fn convert_rgb_tensor(&self, rgb_matrix: &ArrayView2<f32>) -> Array1<f32> {
-        let weights = arr1(&self.weights());
-        rgb_matrix.dot(&weights)
-    }
-
-    /// Vectorized conversion of packed 24-bit RGB pixel buffers into a scalar 8-bit luma slice.
-    ///
-    /// # Arguments
-    /// * `rgb` - Interleaved 8-bit RGB bytes (length must be multiple of 3).
-    /// * `out_luma` - Output buffer destination.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::suboptimal_flops
-    )]
-    fn convert_rgb_slice(&self, rgb: &[u8], out_luma: &mut [u8]) {
-        let count = (rgb.len() / 3).min(out_luma.len());
-        if count == 0 {
-            return;
-        }
-        let [wr, wg, wb] = self.weights();
-        for (out, chunk) in out_luma[..count].iter_mut().zip(rgb.as_chunks::<3>().0) {
-            let r = f32::from(chunk[0]);
-            let g = f32::from(chunk[1]);
-            let b = f32::from(chunk[2]);
-            *out = (wr * r + wg * g + wb * b).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-
-    /// Vectorized conversion of packed 32-bit RGBA pixel buffers into a scalar 8-bit luma slice.
-    ///
-    /// # Arguments
-    /// * `rgba` - Interleaved 8-bit RGBA bytes (length must be multiple of 4).
-    /// * `out_luma` - Output buffer destination.
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::suboptimal_flops
-    )]
-    fn convert_rgba_slice(&self, rgba: &[u8], out_luma: &mut [u8]) {
-        let count = (rgba.len() / 4).min(out_luma.len());
-        if count == 0 {
-            return;
-        }
-        let [wr, wg, wb] = self.weights();
-        for (out, chunk) in out_luma[..count].iter_mut().zip(rgba.as_chunks::<4>().0) {
-            let r = f32::from(chunk[0]);
-            let g = f32::from(chunk[1]);
-            let b = f32::from(chunk[2]);
-            *out = (wr * r + wg * g + wb * b).round().clamp(0.0, 255.0) as u8;
-        }
-    }
-}
-
-/// Simple arithmetic average grayscale converter: $Y = \frac{R + G + B}{3}$.
-///
-/// Provides fast, unweighted intensity computation.
-///
-/// # Examples
-/// ```
-/// use reto_core::{LumaConverter, SimpleGrayConverter};
-///
-/// let converter = SimpleGrayConverter::new();
-/// assert_eq!(converter.rgb_to_luma(30, 60, 90), 60);
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SimpleGrayConverter;
-
-impl SimpleGrayConverter {
-    /// Creates a new `SimpleGrayConverter`.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl LumaConverter for SimpleGrayConverter {
-    #[inline]
-    fn weights(&self) -> [f32; 3] {
-        [1.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0]
-    }
-}
-
-/// ITU-R BT.709 high-definition luma converter: $Y = 0.2126 R + 0.7152 G + 0.0722 B$.
-///
-/// # Examples
-/// ```
-/// use reto_core::{Bt709LumaConverter, LumaConverter};
-///
-/// let converter = Bt709LumaConverter::new();
-/// let luma = converter.rgb_to_luma(255, 255, 255);
-/// assert_eq!(luma, 255);
-/// ```
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Bt709LumaConverter;
-
-/// ITU-R BT.709 linear weights for RGB components `[R=0.2126, G=0.7152, B=0.0722]`.
-pub const BT709_RGB_WEIGHTS: [f32; 3] = [0.2126, 0.7152, 0.0722];
-
-impl Bt709LumaConverter {
-    /// Creates a new `Bt709LumaConverter`.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-impl LumaConverter for Bt709LumaConverter {
-    #[inline]
-    fn weights(&self) -> [f32; 3] {
-        BT709_RGB_WEIGHTS
-    }
-}
+use crate::color::LumaConverter;
 
 /// Scaled single-channel 8-bit luma representation of an image oriented along its major stacking axis.
 ///
@@ -548,6 +408,7 @@ pub const fn median9(mut p: [u8; 9]) -> u8 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::color::{Bt709LumaConverter, SimpleGrayConverter};
     use image::{Rgba, RgbaImage};
 
     #[test]
@@ -680,15 +541,5 @@ mod tests {
         assert_eq!(strip.get_xy(5, 5), 0);
         // Max pixel (220) should stretch higher
         assert!(strip.get_xy(90, 40) > 150);
-    }
-
-    #[test]
-    fn test_bt709_tensor_dot() {
-        let rgb_data = vec![1.0_f32, 1.0, 1.0, 1.0, 0.0, 0.0];
-        let rgb_mat = ArrayView2::from_shape((2, 3), &rgb_data).expect("valid shape");
-        let conv = Bt709LumaConverter::new();
-        let luma = conv.convert_rgb_tensor(&rgb_mat);
-        assert!((luma[0] - 1.0).abs() < 1e-4);
-        assert!((luma[1] - 0.2126).abs() < 1e-4);
     }
 }

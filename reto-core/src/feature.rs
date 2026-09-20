@@ -3778,8 +3778,9 @@ impl PointDetector for SuperPointDetector {
 #[allow(clippy::unwrap_used, clippy::float_cmp)]
 mod tests {
     use super::*;
+    use crate::color::Bt709LumaConverter;
     use crate::geom::NormalizedRect;
-    use crate::luma::{Bt709LumaConverter, ScaledGrayscaleStrip, PROJECTION_MAX_DIMENSION};
+    use crate::luma::{ScaledGrayscaleStrip, PROJECTION_MAX_DIMENSION};
     use image::{Rgba, RgbaImage};
 
     #[test]

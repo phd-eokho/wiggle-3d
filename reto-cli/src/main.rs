@@ -50,6 +50,22 @@ pub struct Cli {
     #[arg(long)]
     pub no_dither: bool,
 
+    /// Enable 24-bit `TrueColor` HEVC MP4 video generation alongside GIF
+    #[arg(long)]
+    pub enable_mp4: bool,
+
+    /// Force NVIDIA NVENC hardware encoder for HEVC MP4 generation (requires NVIDIA driver)
+    #[arg(long)]
+    pub enable_nvenc: bool,
+
+    /// Number of continuous ping-pong wiggle loop cycles encoded into the MP4 video (default: 4)
+    #[arg(long, default_value_t = reto_core::DEFAULT_MP4_LOOPS, value_name = "COUNT")]
+    pub mp4_loops: usize,
+
+    /// Quality / Constant Rate Factor for HEVC video encoding (0-51, lower is higher quality, default: 18)
+    #[arg(long, default_value_t = reto_core::DEFAULT_MP4_CRF, value_name = "CRF")]
+    pub mp4_crf: u32,
+
     /// Disable terminal progress bar
     #[arg(long)]
     pub no_progress: bool,
@@ -251,8 +267,35 @@ fn main() -> anyhow::Result<()> {
 
     let total_files = files.len();
     let gif_config = reto_core::WiggleGifConfig::new(cli.gif_delay).with_dither(!cli.no_dither);
+    let video_config = if cli.enable_mp4 || cli.enable_nvenc {
+        let v_cfg = reto_core::WiggleVideoConfig::new()
+            .with_loops(cli.mp4_loops)
+            .with_crf(cli.mp4_crf)
+            .with_nvenc(cli.enable_nvenc);
+
+        // Pre-flight availability check for video encoder backend before executing batch
+        match reto_core::probe_video_encoder_backend(&v_cfg) {
+            Ok(backend) => {
+                tracing::info!(
+                    backend = %backend,
+                    loops = v_cfg.loops,
+                    crf = v_cfg.crf,
+                    "Hardware HEVC MP4 video encoding enabled"
+                );
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "MP4 video export requested (--enable-mp4), but no available HEVC video encoder backend was found on this host: {e}"
+                );
+            }
+        }
+        Some(v_cfg)
+    } else {
+        None
+    };
     let mut request = BatchProcessingRequest::new(files, cli.output.clone(), cli.debug)
-        .with_gif_config(gif_config);
+        .with_gif_config(gif_config)
+        .with_video_config(video_config);
 
     let progress_bar = if is_tty {
         let pb = ProgressBar::new(total_files as u64);
@@ -337,6 +380,32 @@ mod tests {
         assert!(cli.no_progress);
         assert!(cli.quiet);
         assert_eq!(cli.log_file, Some(PathBuf::from("custom.log")));
+        assert!(!cli.enable_mp4);
+        assert!(!cli.enable_nvenc);
+        assert_eq!(cli.mp4_loops, 4);
+        assert_eq!(cli.mp4_crf, 18);
+    }
+
+    #[test]
+    fn test_cli_parsing_mp4_options() {
+        let args = vec![
+            "reto-cli",
+            "-i",
+            "scans/",
+            "-o",
+            "output/",
+            "--enable-mp4",
+            "--enable-nvenc",
+            "--mp4-loops",
+            "6",
+            "--mp4-crf",
+            "22",
+        ];
+        let cli = Cli::try_parse_from(args).expect("Should parse MP4 arguments");
+        assert!(cli.enable_mp4);
+        assert!(cli.enable_nvenc);
+        assert_eq!(cli.mp4_loops, 6);
+        assert_eq!(cli.mp4_crf, 22);
     }
 
     #[test]

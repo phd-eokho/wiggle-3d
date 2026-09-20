@@ -23,3 +23,4 @@ kstring.workspace = true
 sha2.workspace = true
 color_quant.workspace = true
 crossbeam-channel.workspace = true
+libc.workspace = true
