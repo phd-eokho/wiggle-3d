@@ -34,7 +34,7 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 ## Featured Advantages
 
 - **Fully Parallelized Architecture**: Built with a multi-stage streaming pipeline and multi-core parallel execution (`rayon` + asynchronous file I/O). Processes entire directories of high-resolution film scans at maximum throughput with low, bounded memory usage.
-- **Hierarchical 6-DoF Extrinsic Bundle Adjustment**: Optimizes joint camera poses and estimates physical chassis center sag ($\Delta y$) via stack-allocated dyadic reduction trees with Huber loss, eliminating vertical eye-strain oscillation and reducing reprojection errors by $>60\%$.
+- **Hierarchical 6-DoF Extrinsic Bundle Adjustment**: Optimizes joint camera poses and estimates physical chassis center sag ($\Delta y$) via stack-allocated dyadic reduction trees with Huber loss, eliminating vertical eye-strain oscillation and reducing reprojection errors by >60%.
 - **Subpixel Spatial Gradient Refinement with Drift Gating**: Refines neural keypoint coordinates to subpixel accuracy using 2D spatial structure tensors while defensively gating drift near wide-angle lens distortion peripheries.
 - **Adaptive $\mathrm{SE}(3)$ Motion Uniformity**: Automatically computes $\mathrm{SE}(3)$ (Special Euclidean group / 6-DoF rigid motion) arc-length geodesic distances along the camera trajectory to dynamically balance inter-frame display delays, ensuring smooth, constant-speed stereoscopic animation across asymmetric lens baselines.
 - **Intelligent Facial Detection & Focal Locking**: Automatically identifies human subjects and facial landmarks from the user's perspective, locking the stereoscopic focal plane onto faces so the main subject remains sharp, stable, and perfectly anchored.
@@ -51,7 +51,7 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 
 #### 1-Line Standalone Installer (Recommended)
 
-**Linux / macOS:**
+**Linux:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
@@ -61,7 +61,7 @@ For NVIDIA GPU acceleration (CUDA & NVENC):
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
 
-*To uninstall (Linux / macOS):*
+*To uninstall (Linux):*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh -s -- --uninstall
 ```
@@ -81,7 +81,7 @@ $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
 ```
 
-The installer installs the pre-built CLI binary (`~/.local/bin/reto-cli` on Linux/macOS or `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe` on Windows) and automatically configures the required ONNX Runtime dynamic libraries.
+The installer installs the pre-built CLI binary (`~/.local/bin/reto-cli` on Linux or `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe` on Windows) and automatically configures the required ONNX Runtime dynamic libraries.
 
 #### Build from Source (Developers)
 
