@@ -929,7 +929,10 @@ pub fn interpolate_bspline_2d(p: &[[f32; 2]; 4], t: f32) -> [f32; 2] {
     let b = cubic_bspline_basis(t);
     let mut out = [0.0_f32; 2];
     for (i, v) in out.iter_mut().enumerate() {
-        *v = b[0].mul_add(p[0][i], b[1].mul_add(p[1][i], b[2].mul_add(p[2][i], b[3] * p[3][i])));
+        *v = b[0].mul_add(
+            p[0][i],
+            b[1].mul_add(p[1][i], b[2].mul_add(p[2][i], b[3] * p[3][i])),
+        );
     }
     out
 }
@@ -941,7 +944,10 @@ pub fn interpolate_bspline_3d(p: &[[f32; 3]; 4], t: f32) -> [f32; 3] {
     let b = cubic_bspline_basis(t);
     let mut out = [0.0_f32; 3];
     for (i, v) in out.iter_mut().enumerate() {
-        *v = b[0].mul_add(p[0][i], b[1].mul_add(p[1][i], b[2].mul_add(p[2][i], b[3] * p[3][i])));
+        *v = b[0].mul_add(
+            p[0][i],
+            b[1].mul_add(p[1][i], b[2].mul_add(p[2][i], b[3] * p[3][i])),
+        );
     }
     out
 }
@@ -959,7 +965,10 @@ pub fn interpolate_catmull_rom_3d(
     let w = catmull_rom_basis(t);
     let mut out = [0.0_f32; 3];
     for (i, v) in out.iter_mut().enumerate() {
-        *v = w[0].mul_add(p0[i], w[1].mul_add(p1[i], w[2].mul_add(p2[i], w[3] * p3[i])));
+        *v = w[0].mul_add(
+            p0[i],
+            w[1].mul_add(p1[i], w[2].mul_add(p2[i], w[3] * p3[i])),
+        );
     }
     out
 }
@@ -1007,7 +1016,11 @@ impl Quaternion {
     #[inline]
     #[must_use]
     pub fn normalize(self) -> Self {
-        let norm_sq = self.w.mul_add(self.w, self.x.mul_add(self.x, self.y.mul_add(self.y, self.z * self.z)));
+        let norm_sq = self.w.mul_add(
+            self.w,
+            self.x
+                .mul_add(self.x, self.y.mul_add(self.y, self.z * self.z)),
+        );
         if norm_sq > 1e-12 {
             let inv = 1.0 / norm_sq.sqrt();
             Self {
@@ -1092,7 +1105,8 @@ impl Quaternion {
     #[must_use]
     pub fn slerp(q0: Self, mut q1: Self, t: f32) -> Self {
         let t = t.clamp(0.0, 1.0);
-        let mut dot = q0.w.mul_add(q1.w, q0.x.mul_add(q1.x, q0.y.mul_add(q1.y, q0.z * q1.z)));
+        let mut dot =
+            q0.w.mul_add(q1.w, q0.x.mul_add(q1.x, q0.y.mul_add(q1.y, q0.z * q1.z)));
 
         // Take the shortest path on the 4D sphere
         if dot < 0.0 {
@@ -1165,10 +1179,22 @@ pub fn compute_se3_distance(
     // Relative rotation: q_rel = q2 * q1^-1
     let q1_inv = Quaternion::new(q1.w, -q1.x, -q1.y, -q1.z);
     let q_rel = Quaternion::new(
-        q2.w.mul_add(q1_inv.w, (-q2.x).mul_add(q1_inv.x, (-q2.y).mul_add(q1_inv.y, -q2.z * q1_inv.z))),
-        q2.w.mul_add(q1_inv.x, q2.x.mul_add(q1_inv.w, q2.y.mul_add(q1_inv.z, -q2.z * q1_inv.y))),
-        q2.w.mul_add(q1_inv.y, (-q2.x).mul_add(q1_inv.z, q2.y.mul_add(q1_inv.w, q2.z * q1_inv.x))),
-        q2.w.mul_add(q1_inv.z, q2.x.mul_add(q1_inv.y, (-q2.y).mul_add(q1_inv.x, q2.z * q1_inv.w))),
+        q2.w.mul_add(
+            q1_inv.w,
+            (-q2.x).mul_add(q1_inv.x, (-q2.y).mul_add(q1_inv.y, -q2.z * q1_inv.z)),
+        ),
+        q2.w.mul_add(
+            q1_inv.x,
+            q2.x.mul_add(q1_inv.w, q2.y.mul_add(q1_inv.z, -q2.z * q1_inv.y)),
+        ),
+        q2.w.mul_add(
+            q1_inv.y,
+            (-q2.x).mul_add(q1_inv.z, q2.y.mul_add(q1_inv.w, q2.z * q1_inv.x)),
+        ),
+        q2.w.mul_add(
+            q1_inv.z,
+            q2.x.mul_add(q1_inv.y, (-q2.y).mul_add(q1_inv.x, q2.z * q1_inv.w)),
+        ),
     );
     let omega = q_rel.log_axis_angle();
     let rot_dist_sq = omega[0].mul_add(omega[0], omega[1].mul_add(omega[1], omega[2] * omega[2]));
@@ -1262,12 +1288,7 @@ mod spline_timing_tests {
 
     #[test]
     fn test_bspline_interpolation_2d_and_3d() {
-        let p2d = [
-            [0.0, 0.0],
-            [10.0, 5.0],
-            [20.0, 10.0],
-            [30.0, 15.0],
-        ];
+        let p2d = [[0.0, 0.0], [10.0, 5.0], [20.0, 10.0], [30.0, 15.0]];
         let mid2d = interpolate_bspline_2d(&p2d, 0.5);
         assert!(mid2d[0] > 0.0 && mid2d[0] < 30.0);
         assert!(mid2d[1] > 0.0 && mid2d[1] < 15.0);
@@ -1310,7 +1331,12 @@ mod spline_timing_tests {
         assert!((r_id[2][2] - 1.0).abs() < 1e-5);
 
         // 90 degree rotation around Z
-        let q_z90 = Quaternion::new((std::f32::consts::FRAC_PI_4).cos(), 0.0, 0.0, (std::f32::consts::FRAC_PI_4).sin());
+        let q_z90 = Quaternion::new(
+            (std::f32::consts::FRAC_PI_4).cos(),
+            0.0,
+            0.0,
+            (std::f32::consts::FRAC_PI_4).sin(),
+        );
         let slerp_mid = Quaternion::slerp(q_id, q_z90, 0.5);
         let omega = slerp_mid.log_axis_angle();
         let angle = (omega[0] * omega[0] + omega[1] * omega[1] + omega[2] * omega[2]).sqrt();
@@ -1340,5 +1366,3 @@ mod spline_timing_tests {
         assert!((sum_cr - 1.0).abs() < 1e-5);
     }
 }
-
-

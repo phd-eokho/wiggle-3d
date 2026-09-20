@@ -1381,8 +1381,7 @@ mod tests {
         let f2 = RgbaImage::new(50, 50);
         let frames = [f0, f1, f2];
 
-        let config = WiggleGifConfig::new(100)
-            .with_adaptive_delays([80, 120]);
+        let config = WiggleGifConfig::new(100).with_adaptive_delays([80, 120]);
 
         let mut output = Vec::new();
         let res = WiggleGifBuilder::build_wiggle_gif(&frames, &config, &mut output);
@@ -1390,4 +1389,3 @@ mod tests {
         assert!(!output.is_empty());
     }
 }
-

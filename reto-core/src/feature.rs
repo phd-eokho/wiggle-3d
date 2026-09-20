@@ -1312,7 +1312,11 @@ impl HierarchicalReductionTree {
         }
 
         // Ensure root span (0, n-1) is included
-        if n > 2 && !spans.iter().any(|s| s.start_frame == 0 && s.end_frame == n - 1) {
+        if n > 2
+            && !spans
+                .iter()
+                .any(|s| s.start_frame == 0 && s.end_frame == n - 1)
+        {
             let mid = n / 2;
             let (obs, count) = obs_map.get(&(0, n - 1)).copied().unwrap_or(((0.0, 0.0), 0));
             let status = if count > 0 {
@@ -1391,7 +1395,10 @@ impl HierarchicalReductionTree {
         clippy::too_many_lines,
         clippy::imprecise_flops
     )]
-    pub fn optimize(&self, config: &HierarchicalExtrinsicsConfig) -> HierarchicalOptimizationReport {
+    pub fn optimize(
+        &self,
+        config: &HierarchicalExtrinsicsConfig,
+    ) -> HierarchicalOptimizationReport {
         let n = self.num_frames;
         if n < 2 || self.spans.is_empty() {
             return HierarchicalOptimizationReport {
@@ -1744,7 +1751,13 @@ impl HierarchicalReductionTree {
         let level_rmse_px: Vec<f32> = level_sq
             .iter()
             .zip(level_cnt.iter())
-            .map(|(&sq, &cnt)| if cnt > 0 { (sq / cnt as f32).sqrt() } else { 0.0 })
+            .map(|(&sq, &cnt)| {
+                if cnt > 0 {
+                    (sq / cnt as f32).sqrt()
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         tracing::info!(
@@ -1928,11 +1941,20 @@ impl ChassisExtrinsics {
             return Self::default();
         }
         let cfg = config.copied().unwrap_or_default();
-        let tree = HierarchicalReductionTree::build_from_match_sets(frames, match_sets, orientation);
+        let tree =
+            HierarchicalReductionTree::build_from_match_sets(frames, match_sets, orientation);
         let report = tree.optimize(&cfg);
 
-        let t01 = report.adjacent_translations.first().copied().unwrap_or((0.0, 0.0));
-        let t12 = report.adjacent_translations.get(1).copied().unwrap_or((0.0, 0.0));
+        let t01 = report
+            .adjacent_translations
+            .first()
+            .copied()
+            .unwrap_or((0.0, 0.0));
+        let t12 = report
+            .adjacent_translations
+            .get(1)
+            .copied()
+            .unwrap_or((0.0, 0.0));
         let t02 = if report.camera_positions.len() >= 3 {
             report.camera_positions[2]
         } else {
@@ -1969,9 +1991,17 @@ impl ChassisExtrinsics {
     /// Computes adaptive frame delays $(\Delta t_{01}, \Delta t_{12})$ in milliseconds for uniform motion.
     #[must_use]
     #[allow(clippy::tuple_array_conversions)]
-    pub fn compute_adaptive_frame_delays(&self, total_period_ms: u32, min_delay_ms: u32) -> (u32, u32) {
+    pub fn compute_adaptive_frame_delays(
+        &self,
+        total_period_ms: u32,
+        min_delay_ms: u32,
+    ) -> (u32, u32) {
         let (d01, d12) = self.compute_motion_distances(0.0);
-        let delays = crate::geom::compute_non_uniform_frame_delays(&[d01, d12], total_period_ms, min_delay_ms);
+        let delays = crate::geom::compute_non_uniform_frame_delays(
+            &[d01, d12],
+            total_period_ms,
+            min_delay_ms,
+        );
         if delays.len() >= 2 {
             (delays[0], delays[1])
         } else {
@@ -4299,26 +4329,17 @@ mod tests {
         let frames = [f0, f1, f2];
         let m01 = PairwiseMatchSet::new(
             (0, 1),
-            vec![
-                FeatureMatch::new(0, 0, 0.9),
-                FeatureMatch::new(1, 1, 0.9),
-            ],
+            vec![FeatureMatch::new(0, 0, 0.9), FeatureMatch::new(1, 1, 0.9)],
             MatchDirection::Mutual,
         );
         let m12 = PairwiseMatchSet::new(
             (1, 2),
-            vec![
-                FeatureMatch::new(0, 0, 0.9),
-                FeatureMatch::new(1, 1, 0.9),
-            ],
+            vec![FeatureMatch::new(0, 0, 0.9), FeatureMatch::new(1, 1, 0.9)],
             MatchDirection::Mutual,
         );
         let m02 = PairwiseMatchSet::new(
             (0, 2),
-            vec![
-                FeatureMatch::new(0, 0, 0.9),
-                FeatureMatch::new(1, 1, 0.9),
-            ],
+            vec![FeatureMatch::new(0, 0, 0.9), FeatureMatch::new(1, 1, 0.9)],
             MatchDirection::Mutual,
         );
 
