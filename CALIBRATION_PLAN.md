@@ -75,19 +75,58 @@ SuperPoint yields reliable keypoints across wide disparities, but residual misma
 ```
 
 ### 3.1. Pairwise Matching & Triplet Cycle Filter
-1. **Compute Pairwise Matches:**
-   Extract SuperPoint keypoints $\mathbf{k}_0, \mathbf{k}_1, \mathbf{k}_2$ and match all three pairs with mutual nearest neighbor checks:
-   - $\mathcal{M}_{01} = \{ (\mathbf{p}_0^i, \mathbf{p}_1^j) \}$
-   - $\mathcal{M}_{12} = \{ (\mathbf{p}_1^j, \mathbf{p}_2^k) \}$
-   - $\mathcal{M}_{02} = \{ (\mathbf{p}_0^i, \mathbf{p}_2^l) \}$
+1. **Compute Pairwise Matches Across All Pairs $\binom{N}{2}$:**
+   For $N$ sequential lenses ($L_0, L_1, \dots, L_{N-1}$), compute mutual nearest-neighbor matches across all $\binom{N}{2}$ pairs (for $N=3$: $\mathcal{M}_{01}, \mathcal{M}_{12}, \mathcal{M}_{02}$; for $N=4$: $\mathcal{M}_{01}, \mathcal{M}_{12}, \mathcal{M}_{23}, \mathcal{M}_{02}, \mathcal{M}_{13}, \mathcal{M}_{03}$).
+   - Direct observations on wide baselines (e.g. $\mathcal{M}_{02}$ for $N=3$, $\mathcal{M}_{03}$ for $N=4$) provide **$2\times\text{--}3\times$ higher depth resolution** ($\sigma_Z \propto \frac{Z^2}{B \cdot f}$) than single-step adjacent pairs.
 
 2. **Cycle Closure & Transitive Consistency:**
-   Form triplet track candidates $\mathcal{T} = (\mathbf{p}_0^i, \mathbf{p}_1^j, \mathbf{p}_2^k)$ where $(\mathbf{p}_0^i, \mathbf{p}_1^j) \in \mathcal{M}_{01}$ and $(\mathbf{p}_1^j, \mathbf{p}_2^k) \in \mathcal{M}_{12}$.
-   Validate consistency against direct match $\mathcal{M}_{02}$:
-   $$\|\mathbf{p}_2^k - \mathbf{p}_2^l\|_2 \le \epsilon_{\text{cycle}} \quad (\text{typically } \epsilon_{\text{cycle}} \le 1.5\text{ px})$$
-   Any candidate failing cycle closure or showing contradictory transitive links is rejected immediately.
+   For each triplet combination $(i, j, k)$ with $0 \le i < j < k < N$:
+   Form candidate tracks where $(\mathbf{p}_i, \mathbf{p}_j) \in \mathcal{M}_{ij}$ and $(\mathbf{p}_j, \mathbf{p}_k) \in \mathcal{M}_{jk}$.
+   Validate consistency against direct long-baseline observation $(\mathbf{p}_i, \mathbf{p}_k^{(ik)}) \in \mathcal{M}_{ik}$:
+   $$\epsilon_{\text{cycle}} = \|\mathbf{p}_k^{(jk)} - \mathbf{p}_k^{(ik)}\|_2 \le \epsilon_{\text{threshold}} \quad (\le 1.5\text{ px})$$
+   Any candidate with conflicting transitive links is pruned.
 
-### 3.2. Trifocal Tensor & Multi-View Epipolar Formulation
+### 3.2. Generalization to $N \ge 3$ 1D Adjacent Array & Group Composition
+For a 1D sequence of $N$ rigidly mounted lenses, relative transformations must satisfy group composition across all $\binom{N}{3}$ triplet combinations:
+
+$$\mathbf{T}_{ik} \equiv \mathbf{T}_{jk} \cdot \mathbf{T}_{ij} \iff \begin{bmatrix} \mathbf{R}_{ik} & \mathbf{t}_{ik} \\ \mathbf{0}^\top & 1 \end{bmatrix} = \begin{bmatrix} \mathbf{R}_{jk} & \mathbf{t}_{jk} \\ \mathbf{0}^\top & 1 \end{bmatrix} \begin{bmatrix} \mathbf{R}_{ij} & \mathbf{t}_{ij} \\ \mathbf{0}^\top & 1 \end{bmatrix}$$
+
+* **Essential Matrix / Epipolar Composition:**
+  $$\mathbf{E}_{ik} \sim [\mathbf{t}_{ik}]_\times \mathbf{R}_{ik} = [\mathbf{R}_{jk} \mathbf{t}_{ij} + \mathbf{t}_{jk}]_\times (\mathbf{R}_{jk} \mathbf{R}_{ij})$$
+* **Linear Translation Additivity (Small Rotation Limit $\mathbf{R} \approx \mathbf{I}$):**
+  $$\mathbf{t}_{ik} = \mathbf{t}_{ij} + \mathbf{t}_{jk} \implies \text{disp}_{ik} \equiv \text{disp}_{ij} + \text{disp}_{jk}$$
+
+### 3.3. Hierarchical Cascaded Binary Tree Reduction ($O(N \log N)$ Parallel Verification)
+Rather than evaluating all $\binom{N}{3}$ combinations naively in serial, the 1D sequential layout maps naturally to a **Binary Reduction Tree / Segment Tree** of dyadic intervals:
+
+```
+                            [Level 2: Global Root Chord]
+                                     (0, 3)
+                           E_03 ≡ E_23 · E_12 · E_01
+                                   /        \
+                                  /          \
+                [Level 1: Stride 2]          [Level 1: Stride 2]
+                      (0, 2)                       (1, 3)
+                   E_02 ≡ E_12 · E_01           E_13 ≡ E_23 · E_12
+                       /     \                     /     \
+                      /       \                   /       \
+              [Level 0: Leaves (Stride 1 - Adjacent Pairs)]
+                   (0, 1)          (1, 2)          (2, 3)
+                    E_01            E_12            E_23
+```
+
+#### A. Tree Invariants & Parallel Properties
+1. **Parallel Prefix Composition:**
+   - **Leaves (Level 0, Stride 1):** Measure adjacent pairs $\mathcal{M}_{01}, \mathcal{M}_{12}, \mathcal{M}_{23}, \dots, \mathcal{M}_{N-2, N-1}$.
+   - **Internal Nodes (Level $h$, Stride $2^h$):** Compose pairwise transforms $\mathbf{T}_{i, i+2^h} = \mathbf{T}_{i+2^{h-1}, i+2^h} \cdot \mathbf{T}_{i, i+2^{h-1}}$.
+   - **Root Span $(0, N-1)$:** Enforces total global chord consistency $\mathbf{T}_{0, N-1} \equiv \prod_{i=0}^{N-2} \mathbf{T}_{i, i+1}$.
+2. **Computational Complexity:**
+   - **Total Comparisons:** $O(N \log N)$ structured dyadic comparisons (vs. $O(N^3)$ exhaustive triplets).
+   - **Parallel Critical Path:** $O(\log N)$ tree depth latency executed concurrently across Rayon threads.
+3. **Hierarchical Outlier Pruning:**
+   If an adjacent leaf pair $(i, i+1)$ exhibits high epipolar residual, all transitive multi-view tracks passing through node $(i, i+1)$ are pruned in $O(1)$ without propagating errors to higher tree levels.
+
+### 3.4. Trifocal Tensor & Multi-View Epipolar Formulation
 For every validated triplet correspondence $(\mathbf{x}_0, \mathbf{x}_1, \mathbf{x}_2)$, the points must simultaneously satisfy:
 1. **Pairwise Epipolar Constraints:**
    $$\mathbf{x}_1^\top \mathbf{F}_{01} \mathbf{x}_0 = 0, \quad \mathbf{x}_2^\top \mathbf{F}_{12} \mathbf{x}_1 = 0, \quad \mathbf{x}_2^\top \mathbf{F}_{02} \mathbf{x}_0 = 0$$
@@ -95,10 +134,72 @@ For every validated triplet correspondence $(\mathbf{x}_0, \mathbf{x}_1, \mathbf
    Given $\mathbf{x}_0$ and $\mathbf{x}_1$, the predicted position in frame 2 is uniquely constrained by the trifocal tensor $\mathcal{T}_i^{jk}$:
    $$x_2^k = x_0^i l_1^j \mathcal{T}_i^{jk}$$
 
-### 3.3. Joint Levenberg-Marquardt Bundle Adjustment
-Given $N$ robust triplet tracks, we optimize the camera extrinsics $\mathbf{\Theta} = [\mathbf{R}_{01}, \mathbf{t}_{01}, \mathbf{R}_{02}, \mathbf{t}_{02}]$ and 3D triangulated points $\mathbf{X}_i$ by minimizing the robust Huber reprojection loss:
+### 3.5. Joint Levenberg-Marquardt Bundle Adjustment
+Given $N$ robust multi-view tracks, we optimize the camera extrinsics $\mathbf{\Theta} = \{[\mathbf{R}_{0i} \mid \mathbf{t}_{0i}]\}_{i=1}^{N-1}$ and 3D triangulated points $\mathbf{X}_j$ by minimizing the robust Huber reprojection loss:
 
-$$\mathcal{L}(\mathbf{\Theta}, \{\mathbf{X}_i\}) = \sum_{i=1}^N \sum_{v \in \{0, 1, 2\}} \rho_{\text{Huber}}\left( \left\| \mathbf{x}_v^{(i)} - \pi\left(\mathbf{K}_v, \mathbf{R}_v, \mathbf{t}_v, \mathbf{X}_i\right) \right\|^2 \right) + \lambda_{\text{prior}} \|\mathbf{R}_v - \mathbf{I}\|_F^2$$
+$$\mathcal{L}(\mathbf{\Theta}, \{\mathbf{X}_j\}) = \sum_{j=1}^M \sum_{v=0}^{N-1} \rho_{\text{Huber}}\left( \left\| \mathbf{x}_v^{(j)} - \pi\left(\mathbf{K}_v, \mathbf{R}_v, \mathbf{t}_v, \mathbf{X}_j\right) \right\|^2 \right) + \sum_{v=1}^{N-1} \lambda_{\text{prior}} \|\mathbf{R}_v - \mathbf{I}\|_F^2$$
+
+### 3.6. Two-Stage Robust Filtering: Physics-First Optimization & Boundary Slack
+SuperPoint correspondences provide high physical stability across the image plane. To prevent unmodeled wide-angle optical distortion from falsely corrupting the physical extrinsics or discarding valuable boundary matches, we execute a **Two-Stage Physics-Driven Pipeline**:
+
+```
+[Stage A: Central-Anchor Extrinsic Fitting]
+SuperPoint Inliers in Central Zone (r ≤ 0.5·r_max) ──▶ Optimize Rigid Extrinsics [R_ij | t_ij]
+                                                                  │
+                                                                  ▼
+[Stage B: Radial-Adaptive Outlier Filtering]
+Evaluate Reprojection/Epipolar Residuals r_i against Radial Slack Tolerance τ(r)
+      │
+      ├─▶ Center Region (r ≈ 0): Tight physical tolerance (e.g. 1.0 px)
+      └─▶ Boundary Region (r → r_max): Loosened tolerance τ(r) to accommodate uncalibrated barrel distortion
+```
+
+1. **Stage A: Central-Anchor Extrinsic Optimization:**
+   - The central optical zone ($r \le 0.5 \cdot r_{\max}$) has minimal distortion ($\le 0.2\text{ px}$).
+   - Keypoint correspondences in this region are strictly governed by rigid pinhole geometry ($[\mathbf{R}_{ij} \mid \mathbf{t}_{ij}]$).
+### 3.7. Neural Confidence Ranking & Parallax-Aware Subpixel Gating
+
+#### A. Neural Descriptor Matching Confidence as Primary Metric
+Neural matchers (SuperPoint / LightGlue) compute deep semantic feature similarity invariant to substantial lighting, blur, and perspective distortion.
+* **Confidence-Sorted Candidate Sets:** Match sets are ordered by descriptor confidence $C_{\text{match}} \in [0.0, 1.0]$. The top-tier highest-confidence matches anchor the initial rigid extrinsic estimation.
+* **Outlier Filtering Priority:** Geometric verification filters candidate matches starting from the highest neural confidence down to the tail.
+
+#### B. The Parallax Vulnerability in Monocular Subpixel Refinement
+Independent monocular subpixel refinement (e.g. intensity gradient tensor / cornerSubPix) assumes that the local image patch is an identical rigid translation in both views. Under real stereo parallax:
+1. **Perspective Foreshortening & Shear:** Slanted surfaces change aspect ratio between views $L_0$ and $L_1$.
+2. **Asymmetric Corner Drift:** An independent gradient refinement on $L_0$ and $L_1$ can snap to slightly different sub-structures, introducing artificial disparity jitter ($0.2\text{--}0.8\text{ px}$).
+3. **Aperture Sliding on Edges:** Along 1D dominant gradients, refinement slides freely along the edge direction.
+
+```
+       [Raw SuperPoint / LightGlue Matches (Confidence C_match)]
+                                   │
+                                   ▼
+                   [Gradient Tensor Condition Check]
+                   λ_min / λ_max ≥ γ_cond (True 2D Corner?)
+                                  / \
+                           YES   /   \   NO (Aperture / Flat)
+                                /     \
+                               ▼       ▼
+       [Iterative Subpixel Refinement]  [Keep Robust Neural Coord]
+                               │
+               Drift ||Δp|| ≤ 1.0 px?
+                               / \
+                        YES   /   \   NO (Parallax Over-Drift)
+                             /     \
+                            ▼       ▼
+           [Accept Subpixel Coord]  [Fallback to Neural Coord]
+```
+
+#### C. Robust Quality Gating Strategy
+To prevent parallax-induced subpixel degradation while retaining continuous coordinate precision:
+1. **Tensor Well-Conditioning Gate:**
+   Compute eigenvalues $\lambda_{\min}, \lambda_{\max}$ of structure tensor $\mathbf{G}$.
+   If $\lambda_{\min} < \tau_{\min}$ or $\lambda_{\min}/\lambda_{\max} < 0.15$ (indicating a 1D edge vulnerable to sliding under parallax), **skip refinement and keep the robust neural coordinate**.
+2. **Configurable Parallax Drift Clamping (`max_subpixel_drift_px`):**
+   If the refined subpixel displacement exceeds the configurable threshold ($\|\Delta \mathbf{p}\| > \delta_{\max}$, default: $2.5\text{ px}$, tunable across $1.0\text{--}3.5\text{ px}$ for experimental calibration), the subpixel shift is treated as parallax-corrupted and **reverts to the neural coordinate**.
+3. **Joint Triplet Confidence Formulation:**
+   $$\text{Conf}(\mathcal{T}) = \left( C_{01} \cdot C_{12} \cdot C_{02} \right)^{1/3} \cdot \exp\left(-\frac{\|\Delta \mathbf{p}_{0}\| + \|\Delta \mathbf{p}_{1}\| + \|\Delta \mathbf{p}_{2}\|}{3 \cdot \sigma_{\text{drift}}}\right)$$
+   Penalizes high-drift triplets while rewarding strong neural descriptor consensus.
 
 ---
 
