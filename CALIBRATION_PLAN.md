@@ -86,6 +86,13 @@ SuperPoint yields reliable keypoints across wide disparities, but residual misma
    $$\epsilon_{\text{cycle}} = \|\mathbf{p}_k^{(jk)} - \mathbf{p}_k^{(ik)}\|_2 \le \epsilon_{\text{threshold}} \quad (\le 1.5\text{ px})$$
    Any candidate with conflicting transitive links is pruned.
 
+3. **Decoupling Transitive Loop Closure from Inter-Baseline Distortion Ratios:**
+   - **Transitive Group Invariant:** Valid multi-view tracks must satisfy algebraic translation additivity:
+     $$\epsilon_{\text{cascade}} = |\text{disp}_{ik} - (\text{disp}_{ij} + \text{disp}_{jk})| \le \tau_{\text{cascade}}$$
+   - **Distortion-Induced Ratio Variations:** In uncalibrated multi-lens systems, each lens $L_v$ possesses an independent optical center. A single 3D scene point therefore projects onto different radial distortion zones across sub-frames (e.g., peripheral barrel compression in $L_0$ vs. central pinhole region in $L_1$). Consequently, the ratio $\text{disp}_{01} / \text{disp}_{12}$ naturally deviates from the nominal baseline ratio.
+   - **Outlier Pruning Discipline:** Triplet candidate extraction **must not** enforce rigid inter-baseline ratio thresholds (e.g. $\text{disp}_{01} \approx \text{disp}_{12}$), as doing so prematurely discards valid correspondences experiencing optical distortion. Instead, the candidate graph retains all cycle-consistent tracks, leaving disparity variations to be decoupled during joint extrinsic optimization and subsequent non-linear distortion modeling.
+   - **Noise-Floor Gated Direction Check:** Directional sign consistency ($\text{sign}(\text{disp}_{01}) \equiv \text{sign}(\text{disp}_{12})$) is enforced only above a physical noise floor ($\tau_{\text{noise}} \approx 4.0\text{ px}$) to prevent discarding distant background anchor points where disparity is within unrectified mounting jitter.
+
 ### 3.2. Generalization to $N \ge 3$ 1D Adjacent Array & Group Composition
 For a 1D sequence of $N$ rigidly mounted lenses, relative transformations must satisfy group composition across all $\binom{N}{3}$ triplet combinations:
 

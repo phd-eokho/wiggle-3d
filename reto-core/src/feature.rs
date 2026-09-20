@@ -959,19 +959,8 @@ impl TripletConsistencyConfig {
             return None;
         }
 
-        // 3. Disparity ratio consistency check across baselines
-        if disp_01 >= self.min_disparity_px && disp_12 >= self.min_disparity_px {
-            let ratio = disp_01 / disp_12;
-            let ratio_dev = (ratio - self.baseline_ratio).abs() / self.baseline_ratio;
-            if ratio_dev > self.max_disparity_ratio_deviation {
-                return None;
-            }
-        }
-
-        // 4. Cascaded baseline transform additivity & long-baseline anchor consistency
-        // Expected displacement on baseline 1-2 from baseline 0-1 scaled by baseline_ratio
-        let expected_raw_disp_12 = raw_disp_01 / self.baseline_ratio;
-        let cascade_error = (raw_disp_12 - expected_raw_disp_12).abs();
+        // 3. Cascaded baseline transform additivity: T_02 = T_12 * T_01 => raw_disp_02 ≈ raw_disp_01 + raw_disp_12
+        let cascade_error = (raw_disp_02 - (raw_disp_01 + raw_disp_12)).abs();
         if cascade_error > eff_max_cascade_err {
             return None;
         }
@@ -1186,13 +1175,9 @@ fn solve_linear_system_stack(
         }
         if max_row != i {
             for j in 0..n {
-                let tmp = a[i * n + j];
-                a[i * n + j] = a[max_row * n + j];
-                a[max_row * n + j] = tmp;
+                a.swap(i * n + j, max_row * n + j);
             }
-            let tmp_b = b[i];
-            b[i] = b[max_row];
-            b[max_row] = tmp_b;
+            b.swap(i, max_row);
         }
         let pivot = a[i * n + i];
         let inv_pivot = 1.0 / pivot;
@@ -3238,7 +3223,7 @@ pub fn refine_keypoints_subpixel_with_drift(
                 0.0
             };
 
-            if lambda_min < 1e-5 || cond_ratio < 0.05 {
+            if lambda_min < 1e-5 {
                 status = SubpixelStatus::PoorConditioning {
                     min_eigenvalue: lambda_min,
                     cond_ratio,
@@ -3932,9 +3917,18 @@ mod tests {
         let p1_opposing_disp = Point2D::new(120.0, 50.0);
         assert!(config.verify_triplet(p0, p1_opposing_disp, p2).is_none());
 
-        // 4. Outlier due to disparity ratio deviation exceeding tolerance:
-        let p2_ratio_outlier = Point2D::new(75.0, 50.0); // disp_01 = 20, disp_12 = 5 -> ratio = 4.0
-        assert!(config.verify_triplet(p0, p1, p2_ratio_outlier).is_none());
+        // 4. Optical distortion disparity variation (disp_01 = 20, disp_12 = 5 -> disp_02 = 25) is preserved:
+        let p2_distortion = Point2D::new(75.0, 50.0);
+        let res_distortion = config.verify_triplet(p0, p1, p2_distortion);
+        assert!(res_distortion.is_some());
+        let (d01, d12, err) = res_distortion.unwrap();
+        assert_eq!(d01, 20.0);
+        assert_eq!(d12, 5.0);
+        assert_eq!(err, 0.0);
+
+        // 5. Outlier due to cross-baseline jitter between Frame 0 and Frame 2 exceeding tolerance:
+        let p2_jitter = Point2D::new(60.0, 80.0);
+        assert!(config.verify_triplet(p0, p1, p2_jitter).is_none());
     }
 
     #[test]
