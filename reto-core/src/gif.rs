@@ -22,22 +22,6 @@ pub const DEFAULT_NEUQUANT_SAMPLE_FAC: i32 = 10;
 pub const DEFAULT_PALETTE_COLORS: usize = 256;
 
 /// Configuration for Wiggle 3D GIF generation.
-///
-/// # TODO (Adaptive GIF Timing & Motion Interpolation)
-/// - **Non-Uniform Inter-Frame Delays (Physical Baseline Compensation):**
-///   Due to mechanical construction tolerances and assembly errors, multi-lens camera optics
-///   are rarely perfectly collinear along a shared epipolar line or symmetrically spaced. As a result,
-///   the relative rigid transforms (rotations $R_{01}, R_{12}$ and translations $\mathbf{t}_{01}, \mathbf{t}_{12}$)
-///   from Frame 0 $\to$ 1 and Frame 1 $\to$ 2 exhibit slight discrepancies in magnitude and direction.
-///   When simulating continuous linear motion across views, the inter-frame delays of the GIF
-///   ($\Delta t_{0\to 1}$ and $\Delta t_{1\to 2}$) should be adjusted proportionally to the computed
-///   physical disparity/baseline distances rather than using a uniform time split. This ensures
-///   background and parallax features traverse a constant physical distance per unit time, resulting
-///   in a noticeably smoother visual oscillation.
-/// - **Easing Curves & Optical Flow Interpolation:**
-///   Support non-linear timing curves (ease-in / ease-out) at direction turnaround inflection points
-///   (Frames 0 and 2), or intermediate frame blending/morphing (optical flow frame synthesis) for
-///   high-framerate playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WiggleGifConfig {
     /// Inter-frame delay in milliseconds.
@@ -46,6 +30,8 @@ pub struct WiggleGifConfig {
     pub sample_factor: i32,
     /// Whether to apply Floyd-Steinberg error-diffusion dithering.
     pub dither: bool,
+    /// Optional adaptive non-uniform delays `[delay_01_ms, delay_12_ms]` derived from physical extrinsics.
+    pub adaptive_delays_ms: Option<[u32; 2]>,
 }
 
 impl Default for WiggleGifConfig {
@@ -54,6 +40,7 @@ impl Default for WiggleGifConfig {
             delay_ms: DEFAULT_FRAME_DELAY_MS,
             sample_factor: DEFAULT_NEUQUANT_SAMPLE_FAC,
             dither: true,
+            adaptive_delays_ms: None,
         }
     }
 }
@@ -66,6 +53,7 @@ impl WiggleGifConfig {
             delay_ms,
             sample_factor: DEFAULT_NEUQUANT_SAMPLE_FAC,
             dither: true,
+            adaptive_delays_ms: None,
         }
     }
 
@@ -80,6 +68,13 @@ impl WiggleGifConfig {
     #[must_use]
     pub const fn with_dither(mut self, dither: bool) -> Self {
         self.dither = dither;
+        self
+    }
+
+    /// Sets adaptive non-uniform frame delays `[delay_01_ms, delay_12_ms]`.
+    #[must_use]
+    pub const fn with_adaptive_delays(mut self, delays_ms: [u32; 2]) -> Self {
+        self.adaptive_delays_ms = Some(delays_ms);
         self
     }
 }
@@ -1147,10 +1142,10 @@ impl WiggleGifBuilder {
             (0..frames.len()).collect()
         };
 
-        let delay = Delay::from_numer_denom_ms(config.delay_ms, 1);
+        let default_delay = Delay::from_numer_denom_ms(config.delay_ms, 1);
         let mut gif_frames = Vec::with_capacity(loop_indices.len());
 
-        for &frame_idx in &loop_indices {
+        for (step_idx, &frame_idx) in loop_indices.iter().enumerate() {
             let mut buf = frames[frame_idx].clone();
             if config.dither {
                 image::imageops::colorops::dither(&mut buf, &colormap);
@@ -1160,7 +1155,19 @@ impl WiggleGifBuilder {
                 }
             }
 
-            let frame = Frame::from_parts(buf, 0, 0, delay);
+            let frame_delay = if let Some([d01, d12]) = config.adaptive_delays_ms {
+                // Ping-pong step: 0 (0->1: d01), 1 (1->2: d12), 2 (2->1: d12), 3 (1->0: d01)
+                let delay_ms = match step_idx {
+                    0 | 3 => d01,
+                    1 | 2 => d12,
+                    _ => config.delay_ms,
+                };
+                Delay::from_numer_denom_ms(delay_ms, 1)
+            } else {
+                default_delay
+            };
+
+            let frame = Frame::from_parts(buf, 0, 0, frame_delay);
             gif_frames.push(frame);
         }
 
@@ -1362,9 +1369,25 @@ mod tests {
 
         // Should lock shifts exclusively onto face keypoint 1:
         // p1 - p0 = (55 - 50, 52 - 50) = (5.0, 2.0)
-        // p1 - p2 = (55 - 60, 52 - 54) = (-5.0, -2.0)
         assert_eq!(shifts[0], (5.0, 2.0));
         assert_eq!(shifts[1], (0.0, 0.0));
         assert_eq!(shifts[2], (-5.0, -2.0));
     }
+
+    #[test]
+    fn test_build_wiggle_gif_with_adaptive_delays() {
+        let f0 = RgbaImage::new(50, 50);
+        let f1 = RgbaImage::new(50, 50);
+        let f2 = RgbaImage::new(50, 50);
+        let frames = [f0, f1, f2];
+
+        let config = WiggleGifConfig::new(100)
+            .with_adaptive_delays([80, 120]);
+
+        let mut output = Vec::new();
+        let res = WiggleGifBuilder::build_wiggle_gif(&frames, &config, &mut output);
+        assert!(res.is_ok());
+        assert!(!output.is_empty());
+    }
 }
+

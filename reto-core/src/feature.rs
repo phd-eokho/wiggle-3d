@@ -1957,6 +1957,28 @@ impl ChassisExtrinsics {
             hierarchical_report: Some(report),
         }
     }
+
+    /// Computes physical motion distances $(d_{01}, d_{12})$ across adjacent sub-frames.
+    #[must_use]
+    pub fn compute_motion_distances(&self, _alpha: f32) -> (f32, f32) {
+        let d01 = self.translation_01.0.hypot(self.translation_01.1);
+        let d12 = self.translation_12.0.hypot(self.translation_12.1);
+        (d01, d12)
+    }
+
+    /// Computes adaptive frame delays $(\Delta t_{01}, \Delta t_{12})$ in milliseconds for uniform motion.
+    #[must_use]
+    #[allow(clippy::tuple_array_conversions)]
+    pub fn compute_adaptive_frame_delays(&self, total_period_ms: u32, min_delay_ms: u32) -> (u32, u32) {
+        let (d01, d12) = self.compute_motion_distances(0.0);
+        let delays = crate::geom::compute_non_uniform_frame_delays(&[d01, d12], total_period_ms, min_delay_ms);
+        if delays.len() >= 2 {
+            (delays[0], delays[1])
+        } else {
+            let half = total_period_ms / 2;
+            (half, total_period_ms - half)
+        }
+    }
 }
 
 /// Computes the median of a floating-point slice in $\mathcal{O}(N)$ linear time using quickselect partitioning.

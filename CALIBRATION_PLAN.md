@@ -10,7 +10,12 @@ Multi-lens film cameras (such as the RETO 3D, Nishika N8000, and Nimslo) capture
 2. **Optical Lens Aberrations:**
    - Low-cost uncalibrated plastic/acrylic lenses create non-linear radial bowing and tangential decentering.
 
-This document establishes the architecture for **joint extrinsic pose optimization via triplet correspondence cycle consistency** and presents a **comprehensive survey of lens distortion parameterizations** to guide future model selection.
+This document establishes the architecture for **per-shot joint extrinsic pose optimization via triplet correspondence cycle consistency**, explains how **optical distortion errors are decoupled to prevent polluting rigid 6-DoF chassis extrinsics**, and specifies **$\mathrm{SE}(3)$ trajectory parameterization with non-uniform time delay modulation** for perceptually uniform wiggle-gram animations.
+
+### 1.1. Per-Shot vs. Multi-Shot Calibration Paradigm
+* **"Per-Shot" (Online) Calibration:** The algorithm estimates rigid chassis extrinsics and motion parameters dynamically using **only the single 3-subframe film scan** currently being processed, with zero prior factory calibration targets or checkerboards.
+* **Core Objective:** The primary goal is **not** to build a complex high-degree lens distortion model for its own sake, but to **isolate and absorb injection-molded plastic lens aberrations so they do not leak into the 6-DoF extrinsic pose estimation**.
+* **Downstream Motion Regularization:** Once accurate, unpolluted 6-DoF extrinsics $([\mathbf{R}_{01} \mid \mathbf{t}_{01}], [\mathbf{R}_{12} \mid \mathbf{t}_{12}])$ are obtained, we construct an $\mathrm{SE}(3)$ continuous camera trajectory (via SLERP + B-spline) and derive **non-uniform GIF sub-frame time delays ($\Delta t$)**, transforming physically uneven lens placements into visually uniform, constant-velocity wiggle motion.
 
 ---
 
@@ -303,3 +308,27 @@ Option B (Static Chassis Prior): Offline B-Spline / Neural field baked into 2D L
      - `ChassisLutModel` (pre-baked 2D float displacement grid for RETO 3D / Nimslo).
 4. **Diagnostic Taps:**
    - Expose intermediate reprojection error heatmaps and non-collinear chassis offsets ($\Delta y, \Delta z$) via CLI `--debug` tap.
+
+### 5.2. SE(3) Trajectory Parameterization & Non-Uniform Frame Delay Formulation
+
+Once accurate 6-DoF poses $\mathbf{T}_0 = \mathbf{I}, \mathbf{T}_1 = [\mathbf{R}_{01} \mid \mathbf{t}_{01}], \mathbf{T}_2 = [\mathbf{R}_{02} \mid \mathbf{t}_{02}]$ are recovered:
+
+1. **Continuous Motion Arc-Length Metric:**
+   Physical spacing $\|\mathbf{t}_{01}\| \ne \|\mathbf{t}_{12}\|$ and angular variations $\angle \mathbf{R}_{01} \ne \angle \mathbf{R}_{12}$ introduce non-uniform velocity under static frame delays. We define the composite $\mathrm{SE}(3)$ distance metric between consecutive views:
+   $$d(i, i+1) = \sqrt{\|\mathbf{t}_{i, i+1}\|^2 + \alpha \cdot \|\log(\mathbf{R}_{i, i+1})\|^2}$$
+   where $\log(\cdot): \mathrm{SO}(3) \to \mathfrak{so}(3)$ is the matrix logarithm (axis-angle vector) and $\alpha$ balances translation vs. rotational displacement.
+
+2. **Non-Uniform GIF Frame Timing ($\Delta t_i$):**
+   To produce perceived constant velocity $v_{\text{target}}$ in discrete 3-frame looping playback:
+   $$\Delta t_{01} = \text{round}\left(T_{\text{total}} \cdot \frac{d(0, 1)}{d(0, 1) + d(1, 2)}\right), \quad \Delta t_{12} = T_{\text{total}} - \Delta t_{01}$$
+   The resulting per-frame delays (`delay_time_cs`) are written directly into the GIF Graphic Control Extension block.
+
+3. **Continuous Trajectory Interpolation (B-Spline / SLERP):**
+   For synthesizing intermediate virtual viewpoints $s \in [0, 1]$:
+   - **Rotation:** Spherical Linear Interpolation ($\mathrm{SLERP}$) over unit quaternions $\mathbf{q}_0, \mathbf{q}_1, \mathbf{q}_2$.
+   - **Translation:** Uniform cubic B-spline / Catmull-Rom curve over positions $\mathbf{t}_0, \mathbf{t}_1, \mathbf{t}_2$.
+
+### 5.3. Zero-Dependency YAGNI Architecture
+In accordance with YAGNI (You Aren't Gonna Need It) and zero-bloat standards:
+* **No external crate required:** Quaternion SLERP, $\mathrm{SO}(3)$ axis-angle logarithms, and uniform cubic B-spline basis functions are implemented directly in `reto-core::geom` in $< 50$ lines of pure, highly optimized Rust.
+

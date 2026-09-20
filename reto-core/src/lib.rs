@@ -47,9 +47,13 @@ pub use feature::{
     POINT_DETECTION_MAX_LONGEST_EDGE,
 };
 pub use geom::{
+    catmull_rom_basis, compute_non_uniform_frame_delays, compute_se3_distance, cubic_bspline_basis,
+    interpolate_bspline_1d, interpolate_bspline_2d, interpolate_bspline_3d,
+    interpolate_catmull_rom_3d, mat3_mat3_mul, mat3_vec3_mul, monomial_time_vec4, vec4_mat4_mul,
     FrameRoi, FrameRoiSet, GlobalCoord, HorizontalDelegator, LocalCoord, NormalizedRect,
-    OrientationDelegator, PixelRect, Point2D, Size2D, StripOrientation, VerticalDelegator,
-    HORIZONTAL_DELEGATOR, VERTICAL_DELEGATOR,
+    OrientationDelegator, PixelRect, Point2D, Quaternion, Size2D, StripOrientation,
+    VerticalDelegator, BSPLINE_BASIS_MATRIX, CATMULL_ROM_BASIS_MATRIX, HORIZONTAL_DELEGATOR,
+    VERTICAL_DELEGATOR,
 };
 pub use gif::{
     DisparityBinRecord, DisparityHistogramData, NeuQuantColorMap, WiggleAligner, WiggleGifBuilder,
