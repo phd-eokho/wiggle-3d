@@ -89,6 +89,7 @@ impl Default for VaapiHevcEncoder {
 impl HevcFrameEncoder for VaapiHevcEncoder {
     #[allow(clippy::too_many_lines)]
     fn initialize(&mut self, config: &HevcEncoderConfig) -> Result<(), VideoError> {
+        #[cfg(target_os = "linux")]
         unsafe {
             // Check DRM device nodes
             let drm_paths = [
@@ -250,6 +251,14 @@ impl HevcFrameEncoder for VaapiHevcEncoder {
 
             Ok(())
         }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = config;
+            Err(VideoError::UnsupportedPlatform(
+                "Linux VA-API is only supported on Linux".into(),
+            ))
+        }
     }
 
     fn encode_frame(
@@ -268,6 +277,7 @@ impl HevcFrameEncoder for VaapiHevcEncoder {
 
 impl Drop for VaapiHevcEncoder {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         unsafe {
             if !self.display.is_null() && !self._va_lib.is_null() {
                 if self.context_id != 0 {

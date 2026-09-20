@@ -362,6 +362,51 @@ struct DynamicNvencDriver {
     api_version: u32,
 }
 
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn LoadLibraryA(lpLibFileName: *const c_char) -> *mut c_void;
+    fn GetProcAddress(hModule: *mut c_void, lpProcName: *const c_char) -> *mut c_void;
+    fn FreeLibrary(hLibModule: *mut c_void) -> std::ffi::c_int;
+}
+
+#[cfg(not(target_os = "windows"))]
+unsafe fn dyn_load_lib(name: *const c_char) -> *mut c_void {
+    unsafe { libc::dlopen(name, libc::RTLD_NOW | libc::RTLD_LOCAL) }
+}
+
+#[cfg(not(target_os = "windows"))]
+unsafe fn dyn_load_sym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+    unsafe { libc::dlsym(handle, symbol) }
+}
+
+#[cfg(not(target_os = "windows"))]
+unsafe fn dyn_close_lib(handle: *mut c_void) {
+    if !handle.is_null() {
+        unsafe {
+            libc::dlclose(handle);
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn dyn_load_lib(name: *const c_char) -> *mut c_void {
+    unsafe { LoadLibraryA(name) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn dyn_load_sym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void {
+    unsafe { GetProcAddress(handle, symbol) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn dyn_close_lib(handle: *mut c_void) {
+    if !handle.is_null() {
+        unsafe {
+            FreeLibrary(handle);
+        }
+    }
+}
+
 impl DynamicNvencDriver {
     #[allow(clippy::too_many_lines)]
     fn load() -> Result<Self, VideoError> {
@@ -380,7 +425,7 @@ impl DynamicNvencDriver {
             for name in cuda_names {
                 let cname =
                     CString::new(name).map_err(|e| VideoError::NvencUnavailable(e.to_string()))?;
-                let handle = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+                let handle = dyn_load_lib(cname.as_ptr());
                 if !handle.is_null() {
                     cuda_lib = handle;
                     break;
@@ -394,23 +439,23 @@ impl DynamicNvencDriver {
             }
 
             // Load CUDA symbols
-            let sym_init = libc::dlsym(cuda_lib, b"cuInit\0".as_ptr().cast());
-            let sym_dev_get = libc::dlsym(cuda_lib, b"cuDeviceGet\0".as_ptr().cast());
-            let sym_ctx_create = libc::dlsym(cuda_lib, b"cuCtxCreate_v2\0".as_ptr().cast());
+            let sym_init = dyn_load_sym(cuda_lib, b"cuInit\0".as_ptr().cast());
+            let sym_dev_get = dyn_load_sym(cuda_lib, b"cuDeviceGet\0".as_ptr().cast());
+            let sym_ctx_create = dyn_load_sym(cuda_lib, b"cuCtxCreate_v2\0".as_ptr().cast());
             let sym_ctx_create_fallback = if sym_ctx_create.is_null() {
-                libc::dlsym(cuda_lib, b"cuCtxCreate\0".as_ptr().cast())
+                dyn_load_sym(cuda_lib, b"cuCtxCreate\0".as_ptr().cast())
             } else {
                 sym_ctx_create
             };
-            let sym_ctx_destroy = libc::dlsym(cuda_lib, b"cuCtxDestroy_v2\0".as_ptr().cast());
+            let sym_ctx_destroy = dyn_load_sym(cuda_lib, b"cuCtxDestroy_v2\0".as_ptr().cast());
             let sym_ctx_destroy_fallback = if sym_ctx_destroy.is_null() {
-                libc::dlsym(cuda_lib, b"cuCtxDestroy\0".as_ptr().cast())
+                dyn_load_sym(cuda_lib, b"cuCtxDestroy\0".as_ptr().cast())
             } else {
                 sym_ctx_destroy
             };
 
             if sym_init.is_null() || sym_dev_get.is_null() || sym_ctx_create_fallback.is_null() {
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencUnavailable(
                     "Missing required CUDA entrypoint symbols".into(),
                 ));
@@ -426,23 +471,23 @@ impl DynamicNvencDriver {
             };
 
             if cu_init(0) != 0 {
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencUnavailable("cuInit(0) failed".into()));
             }
 
             let mut device: i32 = 0;
             if cu_dev_get(&mut device, 0) != 0 {
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencUnavailable(
                     "cuDeviceGet(&dev, 0) failed".into(),
                 ));
             }
 
-            let sym_ctx_set = libc::dlsym(cuda_lib, b"cuCtxSetCurrent\0".as_ptr().cast());
+            let sym_ctx_set = dyn_load_sym(cuda_lib, b"cuCtxSetCurrent\0".as_ptr().cast());
 
             let mut cu_ctx: *mut c_void = std::ptr::null_mut();
             if cu_ctx_create(&mut cu_ctx, 0, device) != 0 || cu_ctx.is_null() {
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencUnavailable("cuCtxCreate failed".into()));
             }
 
@@ -466,7 +511,7 @@ impl DynamicNvencDriver {
             for name in nvenc_names {
                 let cname =
                     CString::new(name).map_err(|e| VideoError::NvencUnavailable(e.to_string()))?;
-                let handle = libc::dlopen(cname.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL);
+                let handle = dyn_load_lib(cname.as_ptr());
                 if !handle.is_null() {
                     nvenc_lib = handle;
                     break;
@@ -477,7 +522,7 @@ impl DynamicNvencDriver {
                 if let Some(destroy) = cu_ctx_destroy {
                     destroy(cu_ctx);
                 }
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencUnavailable(
                     "NVIDIA NVENC library (libnvidia-encode.so.1 / nvEncodeAPI64.dll) not found"
                         .into(),
@@ -485,8 +530,8 @@ impl DynamicNvencDriver {
             }
 
             let create_instance_sym =
-                libc::dlsym(nvenc_lib, b"NvEncodeAPICreateInstance\0".as_ptr().cast());
-            let get_max_ver_sym = libc::dlsym(
+                dyn_load_sym(nvenc_lib, b"NvEncodeAPICreateInstance\0".as_ptr().cast());
+            let get_max_ver_sym = dyn_load_sym(
                 nvenc_lib,
                 b"NvEncodeAPIGetMaxSupportedVersion\0".as_ptr().cast(),
             );
@@ -495,8 +540,8 @@ impl DynamicNvencDriver {
                 if let Some(destroy) = cu_ctx_destroy {
                     destroy(cu_ctx);
                 }
-                libc::dlclose(nvenc_lib);
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(nvenc_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencUnavailable(
                     "NvEncodeAPICreateInstance symbol not found".into(),
                 ));
@@ -551,8 +596,8 @@ impl DynamicNvencDriver {
                 if let Some(destroy) = cu_ctx_destroy {
                     destroy(cu_ctx);
                 }
-                libc::dlclose(nvenc_lib);
-                libc::dlclose(cuda_lib);
+                dyn_close_lib(nvenc_lib);
+                dyn_close_lib(cuda_lib);
                 return Err(VideoError::NvencError(format!(
                     "NvEncodeAPICreateInstance returned error code: {last_status}"
                 )));
@@ -591,10 +636,10 @@ impl Drop for DynamicNvencDriver {
                 }
             }
             if !self._nvenc_lib.is_null() {
-                libc::dlclose(self._nvenc_lib);
+                dyn_close_lib(self._nvenc_lib);
             }
             if !self._cuda_lib.is_null() {
-                libc::dlclose(self._cuda_lib);
+                dyn_close_lib(self._cuda_lib);
             }
         }
     }
