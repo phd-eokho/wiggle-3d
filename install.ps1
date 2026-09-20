@@ -267,12 +267,12 @@ if ($Version -eq "latest") {
         if ($ReleaseData.tag_name) {
             $ReleaseTag = $ReleaseData.tag_name
         } else {
-            Log-Warn "Could not parse latest release tag via GitHub API; defaulting to v0.1.0."
-            $ReleaseTag = "v0.1.0"
+            Log-Warn "Could not parse latest release tag via GitHub API; defaulting to v0.1.1."
+            $ReleaseTag = "v0.1.1"
         }
     } catch {
-        Log-Warn "Could not fetch latest release tag via GitHub API; defaulting to v0.1.0."
-        $ReleaseTag = "v0.1.0"
+        Log-Warn "Could not fetch latest release tag via GitHub API; defaulting to v0.1.1."
+        $ReleaseTag = "v0.1.1"
     }
 }
 

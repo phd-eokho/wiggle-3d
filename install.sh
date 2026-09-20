@@ -123,8 +123,8 @@ log_info "Detected target platform: ${TARGET_TRIPLE}"
 if [ "$VERSION" = "latest" ]; then
     RELEASE_TAG="$(curl -sSL "https://api.github.com/repos/${REPO}/releases/latest" | grep '"tag_name":' | head -n 1 | sed -E 's/.*"([^"]+)".*/\1/' || true)"
     if [ -z "$RELEASE_TAG" ]; then
-        log_warn "Could not fetch latest release tag via GitHub API; defaulting to v0.1.0."
-        RELEASE_TAG="v0.1.0"
+        log_warn "Could not fetch latest release tag via GitHub API; defaulting to v0.1.1."
+        RELEASE_TAG="v0.1.1"
     fi
 else
     RELEASE_TAG="$VERSION"
