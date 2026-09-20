@@ -1472,7 +1472,7 @@ fn compute_composed_translations(spans: &mut [DyadicSpan]) {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss, clippy::suboptimal_flops)]
 fn screen_and_prune_branches(
     spans: &[DyadicSpan],
     max_branch_residual_px: f32,
@@ -1709,7 +1709,8 @@ fn run_irls_iterations(
 #[allow(
     clippy::cast_precision_loss,
     clippy::similar_names,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops
 )]
 fn check_optimization_fallback(
     n: usize,
@@ -1795,7 +1796,8 @@ fn check_optimization_fallback(
 #[allow(
     clippy::cast_precision_loss,
     clippy::similar_names,
-    clippy::too_many_arguments
+    clippy::too_many_arguments,
+    clippy::suboptimal_flops
 )]
 fn assemble_optimization_report(
     n: usize,
@@ -3555,7 +3557,11 @@ impl StructureTensor2x2 {
     }
 
     #[inline]
-    #[allow(clippy::suspicious_operation_groupings, clippy::suboptimal_flops)]
+    #[allow(
+        clippy::suspicious_operation_groupings,
+        clippy::suboptimal_flops,
+        clippy::manual_midpoint
+    )]
     fn solve_step(self, vx: f32, vy: f32) -> Result<(f32, f32), SubpixelStatus> {
         let det = self.a * self.c - self.b * self.b;
         let tr = self.a + self.c;
