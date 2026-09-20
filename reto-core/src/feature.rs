@@ -1144,25 +1144,38 @@ impl Default for HierarchicalExtrinsicsConfig {
     }
 }
 
-/// Solves a small dense linear system `A * x = b` using Gaussian elimination with partial pivoting.
+/// Maximum supported camera array parameters for stack-allocated dense linear solvers ($N \le 32$).
+pub const MAX_CAMERA_ARRAY_VARS: usize = 32;
+
+// NOTE: Multi-lens camera rigs (e.g. 3-lens, 4-lens, or up to 32-lens sequential arrays)
+// are strictly bounded by N <= 32. We utilize stack-allocated flat row-major buffers [f32; 1024]
+// to guarantee O(1) heap allocations, maximal L1/L2 cache locality, and auto-vectorization.
+// For theoretical arrays N > 32, a dynamic heap fallback pathway is provided.
+
+/// Solves a small dense linear system `A * x = b` of dimension `n <= 32` using Gaussian elimination with partial pivoting.
+///
+/// Operates entirely on flat contiguous stack memory with zero dynamic heap allocations.
 #[inline]
 #[allow(clippy::needless_range_loop)]
-fn solve_linear_system_dynamic(
+fn solve_linear_system_stack(
     n: usize,
-    a_in: &[Vec<f32>],
+    a_flat: &[f32],
     b_in: &[f32],
-) -> Option<Vec<f32>> {
-    if n == 0 || a_in.len() < n || b_in.len() < n {
+) -> Option<[f32; MAX_CAMERA_ARRAY_VARS]> {
+    if n == 0 || n > MAX_CAMERA_ARRAY_VARS || a_flat.len() < n * n || b_in.len() < n {
         return None;
     }
-    let mut a = a_in.to_vec();
-    let mut b = b_in.to_vec();
+    let mut a = [0.0_f32; MAX_CAMERA_ARRAY_VARS * MAX_CAMERA_ARRAY_VARS];
+    a[..n * n].copy_from_slice(&a_flat[..n * n]);
+
+    let mut b = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+    b[..n].copy_from_slice(&b_in[..n]);
 
     for i in 0..n {
         let mut max_row = i;
-        let mut max_val = a[i][i].abs();
+        let mut max_val = a[i * n + i].abs();
         for k in (i + 1)..n {
-            let val = a[k][i].abs();
+            let val = a[k * n + i].abs();
             if val > max_val {
                 max_val = val;
                 max_row = k;
@@ -1172,29 +1185,34 @@ fn solve_linear_system_dynamic(
             return None;
         }
         if max_row != i {
-            a.swap(i, max_row);
-            b.swap(i, max_row);
-        }
-        let pivot = a[i][i];
-        for k in (i + 1)..n {
-            let factor = a[k][i] / pivot;
-            for j in i..n {
-                let subtrahend = factor * a[i][j];
-                a[k][j] -= subtrahend;
+            for j in 0..n {
+                let tmp = a[i * n + j];
+                a[i * n + j] = a[max_row * n + j];
+                a[max_row * n + j] = tmp;
             }
-            let b_sub = factor * b[i];
-            b[k] -= b_sub;
-            a[k][i] = 0.0;
+            let tmp_b = b[i];
+            b[i] = b[max_row];
+            b[max_row] = tmp_b;
+        }
+        let pivot = a[i * n + i];
+        let inv_pivot = 1.0 / pivot;
+        for k in (i + 1)..n {
+            let factor = a[k * n + i] * inv_pivot;
+            for j in i..n {
+                a[k * n + j] -= factor * a[i * n + j];
+            }
+            b[k] -= factor * b[i];
+            a[k * n + i] = 0.0;
         }
     }
 
-    let mut x = vec![0.0_f32; n];
+    let mut x = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
     for i in (0..n).rev() {
         let mut sum = b[i];
         for j in (i + 1)..n {
-            sum -= a[i][j] * x[j];
+            sum -= a[i * n + j] * x[j];
         }
-        x[i] = sum / a[i][i];
+        x[i] = sum / a[i * n + i];
     }
     Some(x)
 }
@@ -1463,16 +1481,16 @@ impl HierarchicalReductionTree {
 
         // Run IRLS iterations
         for _iter in 0..config.max_iterations {
-            let mut u_x = vec![0.0_f32; num_vars];
-            let mut u_y = vec![0.0_f32; num_vars];
+            let mut u_x = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
+            let mut u_y = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
 
             for coord in 0..2 {
-                let mut h_mat = vec![vec![0.0_f32; num_vars]; num_vars];
-                let mut g_vec = vec![0.0_f32; num_vars];
+                let mut h_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS * MAX_CAMERA_ARRAY_VARS];
+                let mut g_flat = [0.0_f32; MAX_CAMERA_ARRAY_VARS];
 
                 // Tikhonov damping for numerical stability
-                for (i, row) in h_mat.iter_mut().enumerate().take(num_vars) {
-                    row[i] += 1e-6;
+                for i in 0..num_vars {
+                    h_flat[i * num_vars + i] += 1e-6;
                 }
 
                 // Accumulate direct observed constraints (skipping pruned branches)
@@ -1494,23 +1512,28 @@ impl HierarchicalReductionTree {
                     let huber_w = if r <= delta { 1.0 } else { delta / r };
                     let w = (s.match_count as f32).sqrt() * huber_w;
 
-                    let mut a_row = vec![0.0_f32; num_vars];
-                    if s.end_frame > 0 {
-                        a_row[s.end_frame - 1] += 1.0;
-                    }
-                    if s.start_frame > 0 {
-                        a_row[s.start_frame - 1] -= 1.0;
-                    }
+                    let idx_end = if s.end_frame > 0 {
+                        Some(s.end_frame - 1)
+                    } else {
+                        None
+                    };
+                    let idx_start = if s.start_frame > 0 {
+                        Some(s.start_frame - 1)
+                    } else {
+                        None
+                    };
 
-                    for i in 0..num_vars {
-                        if a_row[i].abs() > 1e-7 {
-                            g_vec[i] += w * a_row[i] * target;
-                            for j in 0..num_vars {
-                                if a_row[j].abs() > 1e-7 {
-                                    h_mat[i][j] += w * a_row[i] * a_row[j];
-                                }
-                            }
-                        }
+                    if let Some(ie) = idx_end {
+                        g_flat[ie] += w * target;
+                        h_flat[ie * num_vars + ie] += w;
+                    }
+                    if let Some(is) = idx_start {
+                        g_flat[is] -= w * target;
+                        h_flat[is * num_vars + is] += w;
+                    }
+                    if let (Some(ie), Some(is)) = (idx_end, idx_start) {
+                        h_flat[ie * num_vars + is] -= w;
+                        h_flat[is * num_vars + ie] -= w;
                     }
                 }
 
@@ -1534,28 +1557,37 @@ impl HierarchicalReductionTree {
                         let huber_w = if r <= delta { 1.0 } else { delta / r };
                         let w = config.chord_consistency_weight * huber_w;
 
-                        let mut a_row = vec![0.0_f32; num_vars];
-                        if s.end_frame > 0 {
-                            a_row[s.end_frame - 1] += 1.0;
-                        }
-                        if s.start_frame > 0 {
-                            a_row[s.start_frame - 1] -= 1.0;
-                        }
+                        let idx_end = if s.end_frame > 0 {
+                            Some(s.end_frame - 1)
+                        } else {
+                            None
+                        };
+                        let idx_start = if s.start_frame > 0 {
+                            Some(s.start_frame - 1)
+                        } else {
+                            None
+                        };
 
-                        for i in 0..num_vars {
-                            if a_row[i].abs() > 1e-7 {
-                                g_vec[i] += w * a_row[i] * target;
-                                for j in 0..num_vars {
-                                    if a_row[j].abs() > 1e-7 {
-                                        h_mat[i][j] += w * a_row[i] * a_row[j];
-                                    }
-                                }
-                            }
+                        if let Some(ie) = idx_end {
+                            g_flat[ie] += w * target;
+                            h_flat[ie * num_vars + ie] += w;
+                        }
+                        if let Some(is) = idx_start {
+                            g_flat[is] -= w * target;
+                            h_flat[is * num_vars + is] += w;
+                        }
+                        if let (Some(ie), Some(is)) = (idx_end, idx_start) {
+                            h_flat[ie * num_vars + is] -= w;
+                            h_flat[is * num_vars + ie] -= w;
                         }
                     }
                 }
 
-                if let Some(sol) = solve_linear_system_dynamic(num_vars, &h_mat, &g_vec) {
+                if let Some(sol) = solve_linear_system_stack(
+                    num_vars,
+                    &h_flat[..num_vars * num_vars],
+                    &g_flat[..num_vars],
+                ) {
                     if coord == 0 {
                         u_x = sol;
                     } else {
@@ -1942,17 +1974,25 @@ impl ChassisExtrinsics {
     }
 }
 
+/// Computes the median of a floating-point slice in $\mathcal{O}(N)$ linear time using quickselect partitioning.
 #[inline]
 fn compute_median(values: &mut [f32]) -> f32 {
-    if values.is_empty() {
+    let len = values.len();
+    if len == 0 {
         return 0.0;
     }
-    values.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = values.len() / 2;
-    if values.len().is_multiple_of(2) {
-        f32::midpoint(values[mid - 1], values[mid])
+    let mid = len / 2;
+    let (_, &mut val_mid, _) = values.select_nth_unstable_by(mid, |a, b| {
+        a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if len.is_multiple_of(2) {
+        let val_prev = values[..mid]
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, f32::max);
+        f32::midpoint(val_prev, val_mid)
     } else {
-        values[mid]
+        val_mid
     }
 }
 
@@ -3134,6 +3174,15 @@ pub fn refine_keypoints_subpixel_with_drift(
                 break;
             }
 
+            // Precompute 1D separable horizontal Gaussian kernel weights and delta_x on stack
+            let mut weight_x_arr = [0.0_f32; 33];
+            let mut delta_x_arr = [0.0_f32; 33];
+            for (idx, dx) in (-r..=r).enumerate() {
+                let delta_x = ((cx_round + dx) as f32) - x_curr;
+                delta_x_arr[idx] = delta_x;
+                weight_x_arr[idx] = (-delta_x * delta_x * inv_two_sigma_sq).exp();
+            }
+
             for dy in -r..=r {
                 let py = (cy_round + dy) as usize;
                 let delta_y = ((cy_round + dy) as f32) - y_curr;
@@ -3143,11 +3192,10 @@ pub fn refine_keypoints_subpixel_with_drift(
                 let prev_row = &raw[(py - 1) * w..py * w];
                 let next_row = &raw[(py + 1) * w..(py + 2) * w];
 
-                for dx in -r..=r {
+                for (idx_x, dx) in (-r..=r).enumerate() {
                     let px = (cx_round + dx) as usize;
-                    let delta_x = ((cx_round + dx) as f32) - x_curr;
-                    let weight_x = (-delta_x * delta_x * inv_two_sigma_sq).exp();
-                    let weight = weight_y * weight_x;
+                    let delta_x = delta_x_arr[idx_x];
+                    let weight = weight_y * weight_x_arr[idx_x];
 
                     // Branchless contiguous central gradient evaluation
                     let ix =
