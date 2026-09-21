@@ -622,9 +622,15 @@ mod tests {
 
     #[test]
     fn test_probe_video_encoder_backend_nvenc_enforced() {
-        let config = WiggleVideoConfig::new().with_nvenc(true).with_mock_fallback(true);
-        let backend = probe_video_encoder_backend(&config).expect("Probe with enforced NVENC should succeed");
-        assert!(matches!(backend, VideoEncoderBackend::Nvenc | VideoEncoderBackend::SoftwareMock));
+        let config = WiggleVideoConfig::new()
+            .with_nvenc(true)
+            .with_mock_fallback(true);
+        let backend =
+            probe_video_encoder_backend(&config).expect("Probe with enforced NVENC should succeed");
+        assert!(matches!(
+            backend,
+            VideoEncoderBackend::Nvenc | VideoEncoderBackend::SoftwareMock
+        ));
     }
 
     #[test]
