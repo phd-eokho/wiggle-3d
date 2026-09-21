@@ -51,17 +51,21 @@ A raw 3-lens film scan (*left*) automatically partitioned, stabilized with sub-p
 
 #### 1-Line Standalone Installer (Recommended)
 
-**Linux:**
+> [!NOTE]
+> **macOS Compatibility Notice:**
+> macOS binaries (Apple Silicon `aarch64-apple-darwin`) are built and packaged automatically via GitHub Actions CI. However, **macOS has not been tested on physical hardware** and is currently provided as experimental.
+
+**Linux / macOS:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
 
-For NVIDIA GPU acceleration (CUDA & NVENC):
+For NVIDIA GPU acceleration (Linux CUDA & NVENC):
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
 
-*To uninstall (Linux):*
+*To uninstall (Linux / macOS):*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh -s -- --uninstall
 ```
@@ -81,7 +85,7 @@ $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
 ```
 
-The installer installs the pre-built CLI binary (`~/.local/bin/reto-cli` on Linux or `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe` on Windows) and automatically configures the required ONNX Runtime dynamic libraries.
+The installer installs the pre-built CLI binary (`~/.local/bin/reto-cli` on Linux/macOS or `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe` on Windows) and automatically configures the required ONNX Runtime dynamic libraries.
 
 #### Build from Source (Developers)
 

@@ -46,7 +46,7 @@ jobs:
   build-linux:
     name: Build & Package (Linux x86_64)
     needs: [lint-check]
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -144,9 +144,61 @@ jobs:
           path: ${{ env.DIST_DIR }}/*.zip
           if-no-files-found: error
 
+  build-macos:
+    name: Build & Package (macOS aarch64)
+    needs: [lint-check]
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup ONNX Runtime
+        run: bash scripts/setup_onnxruntime.sh --cpu
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --verbose
+
+      - name: Run doc-tests
+        run: cargo test --workspace --doc --verbose
+
+      - name: Build Release Binary
+        run: cargo build --release --locked --bin reto-cli
+
+      - name: Package Release Binary
+        run: |
+          DIST_DIR=$(mktemp -d)
+          echo "DIST_DIR=${DIST_DIR}" >> "$GITHUB_ENV"
+          PKG_NAME="${{ github.ref_name }}"
+          PKG_NAME="${PKG_NAME//\//-}"
+          [ -z "$PKG_NAME" ] && PKG_NAME="${{ github.sha }}"
+          STAGE_DIR="${DIST_DIR}/wiggle-3d-${PKG_NAME}-macos-aarch64"
+          mkdir -p "${STAGE_DIR}"
+          cp target/release/reto-cli "${STAGE_DIR}/"
+          [ -f README.md ] && cp README.md "${STAGE_DIR}/"
+          [ -f LICENSE ] && cp LICENSE "${STAGE_DIR}/"
+          tar -czvf "${DIST_DIR}/wiggle-3d-${PKG_NAME}-macos-aarch64.tar.gz" -C "${DIST_DIR}" "wiggle-3d-${PKG_NAME}-macos-aarch64"
+          zip -r "${DIST_DIR}/wiggle-3d-${PKG_NAME}-macos-aarch64.zip" -j "${STAGE_DIR}"/*
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-aarch64
+          path: |
+            ${{ env.DIST_DIR }}/*.tar.gz
+            ${{ env.DIST_DIR }}/*.zip
+          if-no-files-found: error
+
   publish-release:
     name: Publish GitHub Release
-    needs: [build-linux, build-windows]
+    needs: [build-linux, build-windows, build-macos]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
