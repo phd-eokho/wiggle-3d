@@ -274,22 +274,22 @@ pub fn probe_video_encoder_backend(
 
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        // On Linux: probe NVENC first, then VA-API
-        let mut nv = NvencHevcEncoder::new();
-        if nv.initialize(&probe_cfg).is_ok() {
-            return Ok(VideoEncoderBackend::Nvenc);
-        }
-
+        // On Linux: probe VA-API first, then NVENC
         let mut va = VaapiHevcEncoder::new();
         if va.initialize(&probe_cfg).is_ok() {
             return Ok(VideoEncoderBackend::Vaapi);
+        }
+
+        let mut nv = NvencHevcEncoder::new();
+        if nv.initialize(&probe_cfg).is_ok() {
+            return Ok(VideoEncoderBackend::Nvenc);
         }
 
         if config.fallback_to_mock {
             Ok(VideoEncoderBackend::SoftwareMock)
         } else {
             Err(VideoError::UnsupportedPlatform(
-                "No supported hardware HEVC video encoder (NVENC or VA-API) is available on this system".into(),
+                "No supported hardware HEVC video encoder (VA-API or NVENC) is available on this system".into(),
             ))
         }
     }
@@ -621,10 +621,16 @@ mod tests {
     }
 
     #[test]
+    fn test_probe_video_encoder_backend_nvenc_enforced() {
+        let config = WiggleVideoConfig::new().with_nvenc(true).with_mock_fallback(true);
+        let backend = probe_video_encoder_backend(&config).expect("Probe with enforced NVENC should succeed");
+        assert!(matches!(backend, VideoEncoderBackend::Nvenc | VideoEncoderBackend::SoftwareMock));
+    }
+
+    #[test]
     fn test_probe_video_encoder_backend_nvenc_or_vaapi() {
         let config = WiggleVideoConfig::new();
         let probe_res = probe_video_encoder_backend(&config);
-        // On host with NVENC GPU, probe_res should be Ok(Nvenc)
         eprintln!("probe_video_encoder_backend result: {probe_res:?}");
     }
 }
