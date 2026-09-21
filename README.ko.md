@@ -51,17 +51,21 @@
 
 #### 1-라인 자동 설치 (권장)
 
-**Linux:**
+> [!NOTE]
+> **macOS 호환성 및 테스트 안내:**
+> macOS 바이너리(Apple Silicon `aarch64-apple-darwin`)는 GitHub Actions CI를 통해 자동 빌드 및 패키징됩니다. 다만, **실제 macOS 물리 하드웨어 기기에서의 직접 테스트는 아직 진행되지 않았으므로** 현재 실험적 지원 단계로 제공됩니다.
+
+**Linux / macOS:**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh
 ```
 
-NVIDIA GPU (CUDA & NVENC) 가속 사용 시:
+NVIDIA GPU (Linux CUDA & NVENC) 가속 사용 시:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | WIGGLE3D_CUDA=1 sh
 ```
 
-*삭제(Uninstall) 시 (Linux):*
+*삭제(Uninstall) 시 (Linux / macOS):*
 ```bash
 curl -fsSL https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.sh | sh -s -- --uninstall
 ```
@@ -81,7 +85,7 @@ $env:WIGGLE3D_CUDA = "1"; irm https://raw.githubusercontent.com/phd-eokho/wiggle
 & ([scriptblock]::Create((irm https://raw.githubusercontent.com/phd-eokho/wiggle-3d/main/install.ps1))) -Uninstall
 ```
 
-설치 스크립트는 최적화된 바이너리(Linux: `~/.local/bin/reto-cli`, Windows: `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe`)를 설치하고, 필요한 ONNX Runtime 동적 라이브러리를 자동 설정합니다.
+설치 스크립트는 최적화된 바이너리(Linux/macOS: `~/.local/bin/reto-cli`, Windows: `%LOCALAPPDATA%\Programs\reto3d\reto-cli.exe`)를 설치하고, 필요한 ONNX Runtime 동적 라이브러리를 자동 설정합니다.
 
 #### 소스 코드에서 직접 빌드 (개발자용)
 
